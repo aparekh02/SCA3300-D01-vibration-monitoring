@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+data/raw/*.csv
+data/metrics/*.csv
+!data/raw/.gitkeep
+!data/metrics/.gitkeep
