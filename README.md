@@ -1,4 +1,4 @@
-# Vibration Monitor
+# Vibration Monitor FULL - SCA3300-D01
 
 Engine-room vibration monitoring for a vessel, running on a Raspberry Pi
 with a Murata SCA3300-D01 accelerometer over SPI.
