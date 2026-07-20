@@ -18,10 +18,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import statistics
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import yaml
@@ -42,6 +42,22 @@ def load_config(path: Path) -> dict:
     if path.exists():
         with open(path) as f:
             return yaml.safe_load(f) or {}
+    return {}
+
+
+def find_sensor_config(cfg: dict, name: Optional[str] = None) -> dict:
+    """config.yaml describes a list of sensors (see CLOCKING.md); this
+    probe tool only ever exercises one SCA3300 at a time, so it picks the
+    named sensor, or the first `type: sca3300` entry if none is named."""
+    sensors = cfg.get("sensors", [])
+    if name is not None:
+        for sensor in sensors:
+            if sensor.get("name") == name:
+                return sensor
+        raise ValueError(f"no sensor named {name!r} in config.yaml")
+    for sensor in sensors:
+        if sensor.get("type", "sca3300") == "sca3300":
+            return sensor
     return {}
 
 
@@ -155,6 +171,9 @@ def timing_characterization(sca: SCA3300, duration_s: float) -> dict:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=str(HERE / "config.yaml"))
+    parser.add_argument("--sensor", default=None,
+                         help="name of the sensor entry in config.yaml to probe "
+                              "(default: the first type: sca3300 entry)")
     parser.add_argument("--duration", type=float, default=None,
                          help="timing characterization duration in seconds (default from config, else 60)")
     parser.add_argument("--bus", type=int, default=None)
@@ -164,7 +183,8 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(Path(args.config))
-    spi_cfg = cfg.get("spi", {})
+    sensor_cfg = find_sensor_config(cfg, args.sensor)
+    spi_cfg = sensor_cfg.get("spi", {})
     probe_cfg = cfg.get("probe", {})
 
     bus = args.bus if args.bus is not None else spi_cfg.get("bus", 0)

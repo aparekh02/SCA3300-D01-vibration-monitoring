@@ -38,6 +38,7 @@ daq/
 ├── can_map.todo.yaml       # template the human fills in from can_discover.py output
 ├── requirements.txt
 ├── CLOCKING.md             # multi-sensor clocking design + worked example
+├── HARDWARE_TESTING.md     # how to run tests/hardware/ on real hardware
 ├── tests/
 │   ├── fakes.py             # SCA3300 protocol simulator (no hardware needed)
 │   ├── test_align.py        # align.py interpolation correctness
@@ -47,7 +48,12 @@ daq/
 │   ├── test_can_discover.py # adapter detection, bus analysis, can_map.todo.yaml schema
 │   ├── test_probe_sca3300.py# gravity/CRC-burst/timing-characterization logic
 │   ├── test_clock.py        # SharedClock/Ticker/RealTimeSampler/SensorHub
-│   └── test_acquire.py       # Acquirer end-to-end, via fakes.py
+│   ├── test_acquire.py      # Acquirer end-to-end (incl. multi-sensor), via fakes.py
+│   └── hardware/             # real-hardware-only tests, self-skip without opt-in env var
+│       ├── test_sca3300_hardware.py
+│       ├── test_can_hardware.py
+│       ├── test_acquire_soak.py
+│       └── watch_rpm.py       # manual can_map.yaml confirmation helper (not a test)
 └── README.md               # this file
 ```
 
@@ -62,7 +68,7 @@ pip install -r requirements.txt
 
 Requires Python 3.11+ on Raspberry Pi OS with:
 - SPI enabled (`raspi-config` -> Interface Options -> SPI), sensor wired per
-  `config.yaml`'s `spi.bus` / `spi.device`.
+  `config.yaml`'s `sensors[].spi.bus` / `sensors[].spi.device`.
 - A USB-CAN adapter enumerated as a SocketCAN interface (`ip link show`
   should list it, e.g. `can0`), brought up at the correct bitrate:
   ```bash
@@ -76,24 +82,32 @@ Requires Python 3.11+ on Raspberry Pi OS with:
 - **SPI**: the user running these scripts needs read/write access to
   `/dev/spidev*` (member of the `spi` group on most Raspberry Pi OS images,
   or run as root).
-- **Real-time scheduling** (`acquire.py`'s sampler thread): `SCHED_FIFO`
-  requires root or `CAP_SYS_NICE`. Without it, `acquire.py` logs a warning
-  and runs at normal scheduling -- it still works, just with weaker timing
-  guarantees under system load. Grant the capability instead of running as
-  root where possible:
+- **Real-time scheduling** (each sensor's sampler thread): `SCHED_FIFO`
+  requires root or `CAP_SYS_NICE`. Without it, the default
+  (`sensors[].realtime.required: false`) logs a warning and runs at normal
+  scheduling -- it still works, just with weaker timing guarantees under
+  system load. This is no longer a silent degradation, though: every
+  sampler's `health_status()` reports `sched_fifo_active` / `cpu_pinned`
+  booleans regardless of the warning log, and setting
+  `sensors[].realtime.required: true` turns a denial into a hard startup
+  failure instead of a log line easy to miss. Grant the capability instead
+  of running as root where possible:
   ```bash
   sudo setcap cap_sys_nice+ep $(readlink -f $(which python3))
   ```
-- **CPU isolation** (recommended, not required): to give the sampler
-  thread a core with minimal OS jitter, isolate a core from the general
-  scheduler by adding to `/boot/cmdline.txt` (or `/boot/firmware/cmdline.txt`
-  on newer Raspberry Pi OS):
+- **CPU isolation** (recommended, not required): to give a sampler thread
+  a core with minimal OS jitter, isolate a core from the general scheduler
+  by adding to `/boot/cmdline.txt` (or `/boot/firmware/cmdline.txt` on
+  newer Raspberry Pi OS):
   ```
   isolcpus=3 nohz_full=3 rcu_nocbs=3
   ```
-  then reboot and set `realtime.cpu_core: 3` in `config.yaml`. Adjust the
-  core number for your Pi model (leave core 0 for the OS). This is a
-  standard Linux real-time technique, not sensor-specific.
+  then reboot and set that sensor's `realtime.cpu_core: 3` in
+  `config.yaml`. Adjust the core number for your Pi model (leave core 0
+  for the OS), and give each concurrently-running sensor its own isolated
+  core if you can -- see CLOCKING.md "GIL and concurrent high-rate
+  sensors" for why that matters more than it might seem for more than one
+  sensor at a high rate.
 - **CAN**: bringing an interface up (`ip link set ... up`) requires
   `CAP_NET_ADMIN` (typically via `sudo`); reading/writing frames once it's
   up does not.
@@ -118,6 +132,13 @@ python3 acquire.py                 # runs until Ctrl+C
 cd daq
 python3 -m unittest discover -s tests
 ```
+
+This is the hardware-free suite covered below -- it also includes
+`tests/hardware/`, but those self-skip unless explicitly opted into (see
+`HARDWARE_TESTING.md`), so this command is always safe to run, including
+in this build environment. Once you have the real Pi/sensor/CAN adapter,
+run `HARDWARE_TESTING.md`'s suite too -- it's the only thing that actually
+certifies real-hardware behavior rather than protocol/logic correctness.
 
 None of these require real hardware. `tests/fakes.py` implements a small
 SCA3300 protocol simulator (independent CRC-8 implementation, so a bug in
@@ -151,10 +172,19 @@ What each file covers:
 - `test_probe_sca3300.py` -- gravity check pass/fail, CRC burst pass rate,
   timing characterization shape and target-rate tracking.
 - `test_clock.py` -- deadline-grid alignment across different rates on one
-  clock, missed-deadline resync, block assembly/health tracking, and two
-  concurrent sensors on one `SensorHub` staying independent.
-- `test_acquire.py` -- the SCA3300-to-generic-sampler adapter and a full
-  `Acquirer` start/read-block/stop cycle, including optional disk logging.
+  clock, missed-deadline resync, block assembly/health tracking, two
+  concurrent sensors on one `SensorHub` staying independent,
+  `realtime.required` actually raising on a denied SCHED_FIFO request (and
+  rolling back any sensors already started), the O(1)-eviction regression
+  guard for the rolling health window, and a measured (not asserted-away)
+  characterization of GIL contention between two concurrent 2kHz sensors
+  -- see CLOCKING.md "GIL and concurrent high-rate sensors" for the actual
+  numbers this produced.
+- `test_acquire.py` -- the SCA3300-to-generic-sampler adapter, a full
+  `Acquirer` start/read-block/stop cycle including optional disk logging,
+  and a config-driven two-sensor scenario proving `sensors:` list entries
+  alone (no extra code) are enough to run two independent SCA3300 units
+  concurrently.
 - `test_align.py` -- linear interpolation correctness, clamping outside
   the series' range, and a full block-alignment scenario.
 
@@ -225,8 +255,8 @@ mode-1 select, STATUS read, ACC_X/Y/Z read, WHOAMI read).
 - **Modes 2-4 g-range**: sensitivity (LSB/g) and LPF are cross-referenced
   and consistent across all 3 sources, but the exact +/-g full-scale range
   for modes 2-4 is not confirmed (only Mode 1's +/-3g is, from the brief
-  itself + cross-reference). Irrelevant unless you change `spi.mode` in
-  `config.yaml` away from 1.
+  itself + cross-reference). Irrelevant unless you change a sensor's
+  `spi.mode` in `config.yaml` away from 1.
 - **Exact minimum inter-frame idle time**: the Linux driver applies a 10us
   SPI delay between requests; `sca3300.py` doesn't add an explicit delay
   (two separate `spidev.xfer2()` calls already toggle CS, which should
@@ -264,6 +294,13 @@ bus**, since this build environment has no SPI device or CAN adapter
 attached. Run both on the real Pi and keep their `*_result.json` output for
 the record; nothing here should be treated as validated against real
 hardware until that's done.
+
+**`tests/hardware/` turns exactly that validation into real, runnable
+tests** (pass/fail assertions against real hardware, not just a report to
+eyeball) -- see `HARDWARE_TESTING.md` for what each one certifies and how
+to run them. They're gated behind an environment variable so the default
+`python3 -m unittest discover -s tests` suite (which this build environment
+*can* run) stays hardware-free and always safe.
 
 What to look for when you do:
 - `probe_sca3300.py`: CRC pass rate should be ~100%; the gravity check
@@ -328,11 +365,12 @@ SPI bus directly from the Pi's own real-time thread.
   a tty line discipline without kernel CAN-frame timestamping;
   `can_reader.py` will still run against an slcan bus, but expect more
   jitter in the resulting RPM series than with a native gs_usb adapter.
-- **Block queue**: `acquire.py` uses a bounded in-memory `queue.Queue`
-  (`sampling.queue_maxsize` in config) and drops the oldest block if a
-  consumer falls behind, logging a warning. Optional disk logging
-  (`logging.write_blocks_to_disk`) writes each block as an `.npz` under
-  `logging.raw_dir`.
+- **Block queue**: each sensor gets its own bounded in-memory
+  `queue.Queue` (`sensors[].sampling.queue_maxsize` in config) and drops
+  its oldest block if a consumer falls behind, logging a warning.
+  Optional disk logging (`logging.write_blocks_to_disk`) writes each
+  block as an `.npz` under `logging.raw_dir`, named
+  `<sensor_name>_<t0_ns>.npz`.
 - **`can_map.yaml` is intentionally not shipped** -- only
   `can_map.todo.yaml` (a template/example) is. `can_reader.py` raises a
   clear `CanMapError` if `can_map.yaml` is missing, rather than guessing at

@@ -266,7 +266,11 @@ def main():
     print(f"\nSniffing {iface} ({bustype} @ {bitrate}bps) for {duration:.0f}s ...")
     try:
         seen = sniff_bus(iface, bustype, bitrate, duration)
-    except can.CanError as exc:
+    except (can.CanError, OSError) as exc:
+        # OSError (not just can.CanError) is what actually surfaces for
+        # several real failure modes here: no CAN support in the running
+        # kernel (PF_CAN unsupported), the interface not existing, or a
+        # permissions issue opening the raw socket.
         logger.error("failed to open/sniff CAN bus: %s", exc)
         result = {"adapter": adapter_info, "error": str(exc)}
         (HERE / "can_discover_result.json").write_text(json.dumps(result, indent=2))

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from clock import SharedClock, Ticker, HealthMonitor, RealTimeSampler, SensorHub
+from clock import SharedClock, Ticker, HealthMonitor, RealTimeSampler, SensorHub, set_realtime
 
 
 class FakeTimeSource:
@@ -118,6 +120,34 @@ class TestHealthMonitor(unittest.TestCase):
         self.assertEqual(status["samples_total"], 3)
         self.assertEqual(status["invalid_samples"], 2)
         self.assertAlmostEqual(status["invalid_rate"], 2 / 3)
+
+    def test_recent_window_stays_bounded_at_capacity(self):
+        """The rolling p99 window is a deque(maxlen=...), not an
+        unbounded list -- pushing well past capacity should never grow
+        its memory footprint, and old values should have been evicted."""
+        health = HealthMonitor(500_000, recent_cap=100)
+        for i in range(1000):
+            health.record_interval(500_000 + i)
+        self.assertEqual(len(health._recent_intervals_ns), 100)
+        # Only the last 100 pushed values (900..999 added to base) remain.
+        self.assertEqual(min(health._recent_intervals_ns), 500_000 + 900)
+
+    def test_recording_at_2khz_scale_completes_quickly(self):
+        """Regression guard for the O(n) list.pop(0) bug this replaced:
+        appending well beyond the recent-window cap used to shift the
+        entire list on every call once at capacity, which at a 2kHz
+        sample rate could itself eat into the 500us/sample budget. A
+        deque makes each append O(1) regardless of how many samples have
+        been recorded."""
+        health = HealthMonitor(500_000)  # default recent_cap=20000
+        n = 60_000  # 3x the cap, i.e. deep into steady-state eviction
+        start = time.perf_counter()
+        for i in range(n):
+            health.record_interval(500_000)
+        elapsed = time.perf_counter() - start
+        # Generous ceiling (real hardware needs each call under ~500us on
+        # average): this is checking asymptotic behavior, not exact perf.
+        self.assertLess(elapsed / n, 100e-6, f"record_interval() averaged {elapsed/n*1e6:.1f}us/call")
 
 
 class TestRealTimeSampler(unittest.TestCase):
@@ -259,6 +289,116 @@ class TestSensorHub(unittest.TestCase):
 
         all_health = hub.health()
         self.assertEqual(set(all_health.keys()), {"a", "b"})
+
+
+class TestSetRealtime(unittest.TestCase):
+    def test_reports_success(self):
+        with mock.patch("clock.os.sched_setscheduler") as sched_mock, \
+             mock.patch("clock.os.sched_setaffinity") as affinity_mock:
+            sched_fifo_active, cpu_pinned = set_realtime(priority=80, cpu_core=2)
+        sched_mock.assert_called_once()
+        affinity_mock.assert_called_once()
+        self.assertTrue(sched_fifo_active)
+        self.assertTrue(cpu_pinned)
+
+    def test_reports_failure_without_raising(self):
+        with mock.patch("clock.os.sched_setscheduler", side_effect=PermissionError):
+            sched_fifo_active, cpu_pinned = set_realtime(priority=80, cpu_core=None)
+        self.assertFalse(sched_fifo_active)
+        self.assertFalse(cpu_pinned)  # cpu_core was None, so pinning wasn't attempted either
+
+
+class TestRealtimeRequired(unittest.TestCase):
+    """Covers the 'silent degradation' fix: without realtime_required, a
+    SCHED_FIFO denial is just a warning and the sampler runs anyway (the
+    pre-existing, still-supported behavior). With it set, denial must be a
+    loud, catchable failure instead of an easy-to-miss log line."""
+
+    def test_status_visible_even_when_not_required(self):
+        clock = SharedClock()
+        with mock.patch("clock.os.sched_setscheduler", side_effect=PermissionError):
+            sampler = RealTimeSampler("s", lambda: ((1.0,), True), n_channels=1, rate_hz=2000,
+                                       block_size=5, clock=clock, use_sched_fifo=True,
+                                       realtime_required=False)
+            sampler.start()
+            try:
+                block = sampler.get_block(timeout=5.0)
+            finally:
+                sampler.stop()
+
+        self.assertIsNotNone(block)  # denial did not stop the sampler
+        status = sampler.health_status()
+        self.assertFalse(status["sched_fifo_active"])  # but it's visible, not just logged
+
+    def test_raises_when_required_and_denied(self):
+        clock = SharedClock()
+        with mock.patch("clock.os.sched_setscheduler", side_effect=PermissionError):
+            sampler = RealTimeSampler("s", lambda: ((1.0,), True), n_channels=1, rate_hz=2000,
+                                       block_size=5, clock=clock, use_sched_fifo=True,
+                                       realtime_required=True)
+            with self.assertRaises(RuntimeError):
+                sampler.start()
+
+    def test_hub_start_all_rolls_back_earlier_sensors_on_later_failure(self):
+        """If sensor 'b' fails to start (realtime_required denied), sensor
+        'a' (already running) must be stopped too, not left as an orphaned
+        background thread the caller no longer has a handle on."""
+        hub = SensorHub()
+        hub.add_sensor("a", lambda: ((1.0,), True), n_channels=1, rate_hz=1000, block_size=1000,
+                        use_sched_fifo=False)
+        with mock.patch("clock.os.sched_setscheduler", side_effect=PermissionError):
+            hub.add_sensor("b", lambda: ((1.0,), True), n_channels=1, rate_hz=1000, block_size=1000,
+                            use_sched_fifo=True, realtime_required=True)
+            with self.assertRaises(RuntimeError):
+                hub.start_all()
+
+        self.assertFalse(hub._samplers["a"]._thread.is_alive())
+
+
+class TestConcurrentHighRateSensors(unittest.TestCase):
+    """Characterizes the GIL-contention concern directly rather than just
+    asserting it away: two sensors, each busy-wait-spinning at 2kHz on
+    independent Python threads, competing for the GIL on a real (not
+    isolated, not SCHED_FIFO) core.
+
+    Measured on this build's dev sandbox (4 shared vCPUs, no SCHED_FIFO,
+    no isolcpus): a single 2kHz sensor alone already shows ~8% of
+    intervals outside +-5% of 500us (virtualized scheduling jitter, no
+    contention involved at all); two concurrent 2kHz sensors pushes that
+    to roughly 20-40% run to run. That is real evidence, not a guess: pure
+    busy-wait timing in Python does NOT reliably hit a tight jitter target
+    under multi-sensor GIL contention on a non-isolated core -- see
+    CLOCKING.md "GIL and concurrent high-rate sensors" for the numbers and
+    what to do about it (SCHED_FIFO + isolcpus on real hardware, or the
+    documented MCU front-end fallback). The threshold below is a sanity
+    check that the sampler still makes forward progress under contention
+    -- not a stand-in for the real +-5%/~0-missed acceptance bar, which
+    only tests/hardware/test_acquire_soak.py on real hardware can certify.
+    """
+
+    def test_two_2khz_sensors_hold_cadence_under_mutual_load(self):
+        hub = SensorHub()
+        # ~1.5s worth of samples per sensor at 2kHz.
+        hub.add_sensor("s1", lambda: ((1.0, 1.0, 1.0), True), n_channels=3, rate_hz=2000,
+                        block_size=3000, use_sched_fifo=False)
+        hub.add_sensor("s2", lambda: ((2.0, 2.0, 2.0), True), n_channels=3, rate_hz=2000,
+                        block_size=3000, use_sched_fifo=False)
+
+        hub.start_all()
+        try:
+            block_1 = hub.get_block("s1", timeout=10.0)
+            block_2 = hub.get_block("s2", timeout=10.0)
+        finally:
+            hub.stop_all()
+
+        self.assertIsNotNone(block_1)
+        self.assertIsNotNone(block_2)
+
+        for name, block in (("s1", block_1), ("s2", block_2)):
+            health = hub.health(name)
+            self.assertLess(health["missed_pct"], 60.0,
+                             f"{name}: missed_pct={health['missed_pct']:.1f}% -- sampler appears to have "
+                             f"stalled outright under contention, not just jittered")
 
 
 if __name__ == "__main__":

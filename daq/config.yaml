@@ -5,25 +5,44 @@
 # Confirm each field marked "CONFIRM" against the real installation before
 # trusting Task 2's output.
 
-spi:
-  bus: 0            # CONFIRM: SPI bus number the SCA3300 breakout is wired to
-  device: 0         # CONFIRM: chip-select line (0 = CE0, 1 = CE1)
-  max_speed_hz: 2000000   # datasheet allows up to ~8 MHz; kept conservative until
-                          # probe_sca3300.py's CRC pass-rate/timing results justify raising it
-  mode: 1           # SCA3300 operating mode 1-4. Mode 1 (+/-3g, 70Hz LPF) is the only
-                    # one this build's Task 2 path has been designed/tested against.
-
-sampling:
-  rate_hz: 2000           # fixed-rate timer target; do not change without re-validating
-                           # probe_sca3300.py timing stats at the new rate
-  block_size: 4096         # samples per emitted block (~2.05s at 2kHz)
-  queue_maxsize: 8          # in-memory block queue depth before oldest blocks are dropped
-
-realtime:
-  use_sched_fifo: true
-  priority: 80             # SCHED_FIFO priority (1-99); requires root or CAP_SYS_NICE
-  cpu_core: null            # CONFIRM: an isolated core number (see README "isolcpus"), e.g. 3.
-                            # null = no CPU pinning attempted.
+# One entry per sensor acquire.py should run. Each gets its own real-time
+# thread/queue/health-monitor/fault-domain via clock.SensorHub, sharing one
+# clock -- see CLOCKING.md. Only "sca3300" is implemented today (it's the
+# only sensor this build has); adding a second physical SCA3300 (a
+# different bearing, a different CS line) is just another list entry with
+# a unique `name` and its own `spi`/`sampling`/`realtime` block. Adding a
+# genuinely different sensor *type* means teaching acquire.py how to build
+# its read_fn (see acquire.py's _register_sensor()), same as sca3300's.
+sensors:
+  - name: vibration_main
+    type: sca3300
+    spi:
+      bus: 0            # CONFIRM: SPI bus number the SCA3300 breakout is wired to
+      device: 0         # CONFIRM: chip-select line (0 = CE0, 1 = CE1)
+      max_speed_hz: 2000000   # datasheet allows up to ~8 MHz; kept conservative until
+                              # probe_sca3300.py's CRC pass-rate/timing results justify raising it
+      mode: 1           # SCA3300 operating mode 1-4. Mode 1 (+/-3g, 70Hz LPF) is the only
+                        # one this build's Task 2 path has been designed/tested against.
+    sampling:
+      rate_hz: 2000           # fixed-rate timer target; do not change without re-validating
+                               # probe_sca3300.py timing stats at the new rate
+      block_size: 4096         # samples per emitted block (~2.05s at 2kHz)
+      queue_maxsize: 8          # in-memory block queue depth before oldest blocks are dropped
+    realtime:
+      use_sched_fifo: true
+      required: false          # if true, acquire.py refuses to start this sensor rather than
+                                # silently falling back to normal scheduling when SCHED_FIFO
+                                # can't be obtained (no root/CAP_SYS_NICE) -- see README
+                                # "Required privileges". health_status() also reports
+                                # sched_fifo_active/cpu_pinned either way.
+      priority: 80             # SCHED_FIFO priority (1-99); requires root or CAP_SYS_NICE
+      cpu_core: null            # CONFIRM: an isolated core number (see README "isolcpus"), e.g. 3.
+                                # null = no CPU pinning attempted.
+      spin_margin_us: 50        # tail of each tick spent busy-waiting (vs. sleeping) for precision.
+                                # Measured effect is modest and host-dependent -- see CLOCKING.md
+                                # "GIL and concurrent high-rate sensors" for real numbers from this
+                                # build; don't expect tuning this alone to hit +-5% jitter with
+                                # several concurrent high-rate sensors on a non-isolated core.
 
 logging:
   write_blocks_to_disk: false   # if true, each block is also written under raw_dir

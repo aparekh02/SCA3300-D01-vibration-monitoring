@@ -2,13 +2,15 @@
 """
 acquire.py - Task 2 entry point: deterministic vibration acquisition.
 
-Registers the SCA3300 as one sensor on a clock.SensorHub, which drives it
-at a strict 2kHz on a dedicated real-time thread (monotonic-timer driven,
-not sensor-interrupt or FIFO driven -- the -D01 breakout has neither),
-assembling fixed-length evenly-sampled blocks and tracking health
-(jitter/missed-samples/CRC error rate). The hub is the extension point for
-more sensors -- see CLOCKING.md for how a second sensor would be added and
-still share the same clock/timebase while running independently.
+Registers every sensor listed in config.yaml's `sensors:` list on a
+clock.SensorHub, which drives each at its configured fixed rate on its own
+dedicated real-time thread (monotonic-timer driven, not sensor-interrupt or
+FIFO driven -- the -D01 breakout has neither), assembling fixed-length
+evenly-sampled blocks and tracking health (jitter/missed-samples/CRC error
+rate) per sensor. Adding a second sensor is a config.yaml edit, not a code
+change -- see CLOCKING.md for the design and config.yaml's `sensors:` list
+for the schema; only `type: sca3300` is implemented today since that's the
+only sensor this build has hardware for.
 
 No FFT/diagnostics here -- only acquisition + alignment plumbing, per brief.
 """
@@ -34,8 +36,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger("acquire")
 
 HERE = Path(__file__).resolve().parent
-
-VIBRATION_SENSOR_NAME = "vibration"
 
 
 def load_config(path: Path) -> dict:
@@ -73,58 +73,110 @@ def _safe_reinit(sca: SCA3300):
 
 
 class Acquirer:
-    """Thin SCA3300-specific wrapper around a clock.SensorHub with exactly
-    one sensor registered. Kept as a small class (rather than inlining
-    everything in main()) so probe-style tools/tests can drive it directly
-    without going through argparse/CLI."""
+    """Registers every `sensors:` entry from config.yaml onto a
+    clock.SensorHub. Kept as a small class (rather than inlining everything
+    in main()) so probe-style tools/tests can drive it directly without
+    going through argparse/CLI.
+
+    For the common single-sensor case, get_block()/health_status() work
+    without naming the sensor (there's only one to mean); with more than
+    one registered, callers must say which sensor they want a block from,
+    though health_status() still has a sensible aggregate default.
+    """
 
     def __init__(self, cfg: dict, hub: Optional[SensorHub] = None):
         self._cfg = cfg
-        spi_cfg = cfg["spi"]
-        self._sca = SCA3300(bus=spi_cfg["bus"], device=spi_cfg["device"],
-                             max_speed_hz=spi_cfg["max_speed_hz"], mode=spi_cfg.get("mode", 1))
         self.hub = hub or SensorHub()
+        self._scas: dict = {}
 
-        sampling_cfg = cfg["sampling"]
-        rt_cfg = cfg.get("realtime", {})
         log_cfg = cfg.get("logging", {})
-
         self._write_to_disk = log_cfg.get("write_blocks_to_disk", False)
         self._raw_dir = Path(log_cfg.get("raw_dir", "data/raw"))
         if self._write_to_disk:
             self._raw_dir.mkdir(parents=True, exist_ok=True)
 
-        self._sampler = self.hub.add_sensor(
-            VIBRATION_SENSOR_NAME,
-            read_fn=make_sca3300_read_fn(self._sca),
+        sensors_cfg = cfg["sensors"]
+        if not sensors_cfg:
+            raise ValueError("config.yaml's 'sensors:' list is empty -- nothing to acquire")
+        for sensor_cfg in sensors_cfg:
+            self._register_sensor(sensor_cfg)
+
+    def _register_sensor(self, sensor_cfg: dict):
+        name = sensor_cfg["name"]
+        sensor_type = sensor_cfg.get("type", "sca3300")
+        if sensor_type != "sca3300":
+            raise ValueError(
+                f"sensor {name!r}: unsupported type {sensor_type!r} -- only 'sca3300' is "
+                f"implemented; teach this method how to build its read_fn to add another type"
+            )
+
+        spi_cfg = sensor_cfg["spi"]
+        sca = SCA3300(bus=spi_cfg["bus"], device=spi_cfg["device"],
+                      max_speed_hz=spi_cfg["max_speed_hz"], mode=spi_cfg.get("mode", 1))
+        self._scas[name] = sca
+
+        sampling_cfg = sensor_cfg["sampling"]
+        rt_cfg = sensor_cfg.get("realtime", {})
+        self.hub.add_sensor(
+            name,
+            read_fn=make_sca3300_read_fn(sca),
             n_channels=3,
             rate_hz=sampling_cfg["rate_hz"],
             block_size=sampling_cfg["block_size"],
             queue_maxsize=sampling_cfg.get("queue_maxsize", 8),
             use_sched_fifo=rt_cfg.get("use_sched_fifo", True),
+            realtime_required=rt_cfg.get("required", False),
             priority=rt_cfg.get("priority", 80),
             cpu_core=rt_cfg.get("cpu_core"),
+            spin_margin_ns=int(rt_cfg.get("spin_margin_us", 100) * 1000),
         )
 
+    def sensor_names(self) -> list:
+        return list(self._scas.keys())
+
     def start(self):
-        self._sca.start_up()
-        self.hub.start_all()
+        started = []
+        try:
+            for sca in self._scas.values():
+                sca.start_up()
+                started.append(sca)
+            self.hub.start_all()
+        except Exception:
+            # Don't leave earlier sensors' SPI links initialized (and their
+            # samplers possibly already running) if a later step fails.
+            self.hub.stop_all()
+            for sca in started:
+                sca.close()
+            raise
 
     def stop(self):
         self.hub.stop_all()
-        self._sca.close()
+        for sca in self._scas.values():
+            sca.close()
 
-    def get_block(self, timeout: Optional[float] = None) -> Optional[Block]:
-        block = self.hub.get_block(VIBRATION_SENSOR_NAME, timeout=timeout)
+    def get_block(self, name: Optional[str] = None, timeout: Optional[float] = None) -> Optional[Block]:
+        name = name or self._default_sensor_name()
+        block = self.hub.get_block(name, timeout=timeout)
         if block is not None and self._write_to_disk:
             self._write_block(block)
         return block
 
-    def health_status(self) -> dict:
-        return self.hub.health(VIBRATION_SENSOR_NAME)
+    def health_status(self, name: Optional[str] = None) -> dict:
+        if name is not None:
+            return self.hub.health(name)
+        if len(self._scas) == 1:
+            return self.hub.health(self._default_sensor_name())
+        return self.hub.health()  # aggregate: {sensor_name: status, ...}
+
+    def _default_sensor_name(self) -> str:
+        if len(self._scas) != 1:
+            raise ValueError(
+                f"{len(self._scas)} sensors registered ({self.sensor_names()}) -- specify which one by name"
+            )
+        return next(iter(self._scas))
 
     def _write_block(self, block: Block):
-        fname = self._raw_dir / f"block_{block.t0_ns}.npz"
+        fname = self._raw_dir / f"{block.sensor_name}_{block.t0_ns}.npz"
         np.savez(fname, samples=block.samples, t0_ns=block.t0_ns,
                  sample_rate_hz=block.sample_rate_hz, missed_in_block=block.missed_in_block)
 
@@ -138,6 +190,7 @@ def main():
 
     cfg = load_config(Path(args.config))
     acquirer = Acquirer(cfg)
+    sensor_names = acquirer.sensor_names()
 
     can_reader = None
     can_cfg = cfg.get("can")
@@ -162,24 +215,24 @@ def main():
 
     signal.signal(signal.SIGINT, _handle_sigint)
 
-    logger.info("Starting SCA3300 acquisition (rate=%dHz, block_size=%d)",
-                cfg["sampling"]["rate_hz"], cfg["sampling"]["block_size"])
+    logger.info("Starting acquisition for sensors: %s", sensor_names)
     acquirer.start()
 
     health_interval = cfg.get("logging", {}).get("health_log_interval_s", 5)
     start_time = time.monotonic()
     last_health_log = start_time
-    blocks_emitted = 0
+    blocks_emitted = {name: 0 for name in sensor_names}
 
     try:
         while not stop_requested.is_set():
             if args.duration and (time.monotonic() - start_time) >= args.duration:
                 break
-            block = acquirer.get_block(timeout=0.5)
-            if block is not None:
-                blocks_emitted += 1
-                logger.info("block %d ready: t0_ns=%d missed=%d",
-                            blocks_emitted, block.t0_ns, block.missed_in_block)
+            for name in sensor_names:
+                block = acquirer.get_block(name, timeout=0.1)
+                if block is not None:
+                    blocks_emitted[name] += 1
+                    logger.info("[%s] block %d ready: t0_ns=%d missed=%d",
+                                name, blocks_emitted[name], block.t0_ns, block.missed_in_block)
 
             if time.monotonic() - last_health_log >= health_interval:
                 logger.info("health: %s", acquirer.health_status())

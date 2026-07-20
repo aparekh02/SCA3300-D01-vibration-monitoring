@@ -66,8 +66,12 @@ class TestProbeFunctions(unittest.TestCase):
         sca, _ = self._make_started_sca()
         result = timing_characterization(sca, duration_s=0.2)
         # With a near-instant fake device, the loop is timer-bound, so mean
-        # interval should track the 500us target reasonably closely.
-        self.assertAlmostEqual(result["interval_us"]["mean"], 500.0, delta=100.0)
+        # interval should track the 500us target reasonably closely. Delta
+        # is generous (not the real ~5% acceptance bar) because this runs
+        # on a shared, possibly loaded CI host alongside other tests --
+        # tight timing acceptance belongs to the real-hardware suite in
+        # tests/hardware/ (see HARDWARE_TESTING.md), not this logic check.
+        self.assertAlmostEqual(result["interval_us"]["mean"], 500.0, delta=300.0)
 
 
 if __name__ == "__main__":

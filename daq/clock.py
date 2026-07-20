@@ -30,6 +30,7 @@ import os
 import queue
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -130,8 +131,11 @@ class HealthMonitor:
         self._missed = 0
         self._invalid = 0
         self._samples_total = 0
-        self._recent_intervals_ns: list = []
-        self._recent_cap = recent_cap
+        # deque(maxlen=...) evicts the oldest element in O(1); a plain list
+        # with list.pop(0) here would be O(n) per sample once at capacity --
+        # on a 2kHz path that shift cost alone could threaten the very
+        # 500us budget this monitor exists to measure.
+        self._recent_intervals_ns: deque = deque(maxlen=recent_cap)
         self._lock = threading.Lock()
 
     def record_interval(self, interval_ns: int):
@@ -145,8 +149,6 @@ class HealthMonitor:
             if abs(interval_ns - self._target_ns) > self._tolerance_ns:
                 self._missed += 1
             self._recent_intervals_ns.append(interval_ns)
-            if len(self._recent_intervals_ns) > self._recent_cap:
-                self._recent_intervals_ns.pop(0)
 
     def record_sample(self, valid: bool):
         with self._lock:
@@ -157,7 +159,10 @@ class HealthMonitor:
     def status(self) -> dict:
         with self._lock:
             std_ns = (self._m2 / self._n) ** 0.5 if self._n > 1 else 0.0
-            p99_ns = float(np.percentile(self._recent_intervals_ns, 99)) if self._recent_intervals_ns else None
+            if self._recent_intervals_ns:
+                p99_ns = float(np.percentile(np.fromiter(self._recent_intervals_ns, dtype=np.int64), 99))
+            else:
+                p99_ns = None
             return {
                 "intervals_recorded": self._n,
                 "mean_us": self._mean / 1000.0,
@@ -182,26 +187,34 @@ class Block:
     missed_in_block: int
 
 
-def set_realtime(priority: int, cpu_core: Optional[int]):
+def set_realtime(priority: int, cpu_core: Optional[int]) -> tuple:
     """Best-effort SCHED_FIFO + CPU pin for the calling thread. Requires
-    root or CAP_SYS_NICE; logs and continues at normal scheduling if
-    denied, since the sampler still runs correctly -- just with weaker
-    timing guarantees under load, which is exactly what the health stats
-    and probe tools are meant to surface."""
+    root or CAP_SYS_NICE. Returns (sched_fifo_active, cpu_pinned) rather
+    than just logging, so a caller (or a health dashboard) can tell
+    *without hardware timing degrading first* whether it's actually
+    running with real-time guarantees or silently fell back to normal
+    scheduling -- see RealTimeSampler's `realtime_required` for turning
+    that fallback into a hard failure instead of a easy-to-miss warning."""
+    sched_fifo_active = False
     try:
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
+        sched_fifo_active = True
         logger.info("SCHED_FIFO priority %d set", priority)
     except PermissionError:
         logger.warning("could not set SCHED_FIFO (need root/CAP_SYS_NICE) -- running at normal scheduling")
     except Exception as exc:
         logger.warning("could not set SCHED_FIFO: %s", exc)
 
+    cpu_pinned = False
     if cpu_core is not None:
         try:
             os.sched_setaffinity(0, {cpu_core})
+            cpu_pinned = True
             logger.info("pinned to CPU core %d", cpu_core)
         except Exception as exc:
             logger.warning("could not pin to CPU core %d: %s", cpu_core, exc)
+
+    return sched_fifo_active, cpu_pinned
 
 
 class RealTimeSampler:
@@ -216,6 +229,7 @@ class RealTimeSampler:
     def __init__(self, name: str, read_fn: Callable[[], tuple], n_channels: int, rate_hz: float,
                  block_size: int, clock: SharedClock, queue_maxsize: int = 8,
                  use_sched_fifo: bool = False, priority: int = 80, cpu_core: Optional[int] = None,
+                 realtime_required: bool = False, spin_margin_ns: int = 50_000,
                  on_error: Optional[Callable[[Exception], None]] = None):
         self.name = name
         self._read_fn = read_fn
@@ -229,14 +243,33 @@ class RealTimeSampler:
         self._use_sched_fifo = use_sched_fifo
         self._priority = priority
         self._cpu_core = cpu_core
+        self._realtime_required = realtime_required
+        self._spin_margin_ns = spin_margin_ns
         self._on_error = on_error
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
+        # Real-time status is set from inside the sampler thread (Linux
+        # scheduling policy/affinity are per-thread, so they can only be
+        # applied there), then surfaced here so it's visible in
+        # health_status() instead of only as an easy-to-miss log line.
+        self.sched_fifo_active = False
+        self.cpu_pinned = False
+        self._startup_error: Optional[Exception] = None
+        self._realtime_ready = threading.Event()
+
     def start(self):
         self._stop_event.clear()
+        self._realtime_ready.clear()
+        self._startup_error = None
         self._thread = threading.Thread(target=self._run_loop, name=f"sampler-{self.name}", daemon=True)
         self._thread.start()
+
+        if self._use_sched_fifo:
+            self._realtime_ready.wait(timeout=2.0)
+            if self._startup_error is not None:
+                self.stop()
+                raise self._startup_error
 
     def stop(self):
         self._stop_event.set()
@@ -250,11 +283,26 @@ class RealTimeSampler:
             return None
 
     def health_status(self) -> dict:
-        return self.health.status()
+        status = self.health.status()
+        status["sched_fifo_active"] = self.sched_fifo_active
+        status["cpu_pinned"] = self.cpu_pinned
+        return status
 
     def _run_loop(self):
         if self._use_sched_fifo:
-            set_realtime(self._priority, self._cpu_core)
+            try:
+                self.sched_fifo_active, self.cpu_pinned = set_realtime(self._priority, self._cpu_core)
+                if self._realtime_required and not self.sched_fifo_active:
+                    raise RuntimeError(
+                        f"[{self.name}] realtime.required is set but SCHED_FIFO could not be obtained "
+                        f"(need root or CAP_SYS_NICE) -- refusing to run at normal scheduling instead "
+                        f"of silently degrading timing guarantees"
+                    )
+            except Exception as exc:
+                self._startup_error = exc
+                self._realtime_ready.set()
+                return
+        self._realtime_ready.set()
 
         ticker = Ticker(self._clock, self._period_ns)
         buffer = np.zeros((self._block_size, self._n_channels), dtype=np.float64)
@@ -297,7 +345,7 @@ class RealTimeSampler:
                 block_t0_ns = None
                 missed_in_block = 0
 
-            ticker.wait_for_next_tick()
+            ticker.wait_for_next_tick(spin_margin_ns=self._spin_margin_ns)
 
     def _emit_block(self, block: Block):
         try:
@@ -339,8 +387,19 @@ class SensorHub:
         return list(self._samplers.keys())
 
     def start_all(self):
-        for sampler in self._samplers.values():
-            sampler.start()
+        started = []
+        try:
+            for sampler in self._samplers.values():
+                sampler.start()
+                started.append(sampler)
+        except Exception:
+            # Don't leave earlier sensors running if a later one fails to
+            # start (e.g. realtime_required and SCHED_FIFO was denied) --
+            # one sensor's startup failure shouldn't leave others as an
+            # orphaned, unmanaged background thread.
+            for sampler in started:
+                sampler.stop()
+            raise
 
     def stop_all(self):
         for sampler in self._samplers.values():
