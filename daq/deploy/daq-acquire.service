@@ -1,0 +1,27 @@
+# Runs acquire.py as a system service. Assumes the /opt/daq deployment
+# layout in README.md "Deploying to a Raspberry Pi" (install via install.sh).
+# CAP_SYS_NICE (not root) lets a sampler get SCHED_FIFO without running as
+# root -- see README "Required privileges".
+# Logs: journalctl -u daq-acquire.service -f
+
+[Unit]
+Description=DAQ sensor acquisition (SCA3300 vibration + CAN RPM)
+After=network-online.target daq-can0-up.service
+Wants=network-online.target
+Requires=daq-can0-up.service
+
+[Service]
+Type=simple
+User=daq
+Group=daq
+SupplementaryGroups=spi
+WorkingDirectory=/opt/daq
+ExecStart=/opt/daq/venv/bin/python3 /opt/daq/acquire.py --config /opt/daq/config.yaml
+Restart=on-failure
+RestartSec=5
+
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target
