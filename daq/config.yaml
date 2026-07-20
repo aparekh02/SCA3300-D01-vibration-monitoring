@@ -1,0 +1,44 @@
+# daq/config.yaml
+#
+# Every value that depends on the specific vessel, wiring, or Pi model lives
+# here -- nothing hardware-specific should be hardcoded in the scripts.
+# Confirm each field marked "CONFIRM" against the real installation before
+# trusting Task 2's output.
+
+spi:
+  bus: 0            # CONFIRM: SPI bus number the SCA3300 breakout is wired to
+  device: 0         # CONFIRM: chip-select line (0 = CE0, 1 = CE1)
+  max_speed_hz: 2000000   # datasheet allows up to ~8 MHz; kept conservative until
+                          # probe_sca3300.py's CRC pass-rate/timing results justify raising it
+  mode: 1           # SCA3300 operating mode 1-4. Mode 1 (+/-3g, 70Hz LPF) is the only
+                    # one this build's Task 2 path has been designed/tested against.
+
+sampling:
+  rate_hz: 2000           # fixed-rate timer target; do not change without re-validating
+                           # probe_sca3300.py timing stats at the new rate
+  block_size: 4096         # samples per emitted block (~2.05s at 2kHz)
+  queue_maxsize: 8          # in-memory block queue depth before oldest blocks are dropped
+
+realtime:
+  use_sched_fifo: true
+  priority: 80             # SCHED_FIFO priority (1-99); requires root or CAP_SYS_NICE
+  cpu_core: null            # CONFIRM: an isolated core number (see README "isolcpus"), e.g. 3.
+                            # null = no CPU pinning attempted.
+
+logging:
+  write_blocks_to_disk: false   # if true, each block is also written under raw_dir
+  raw_dir: data/raw
+  health_log_interval_s: 5
+
+can:
+  channel: can0            # CONFIRM: SocketCAN interface name (see `ip link show`)
+  bustype: socketcan        # CONFIRM via can_discover.py: "socketcan" (native gs_usb) or "slcan"
+  bitrate: 250000           # CONFIRM: 250000 is the typical J1939 rate, but verify against the vessel bus
+  protocol: j1939           # "j1939" or "raw"
+  map_file: can_map.yaml    # human-confirmed signal map; copy+edit from can_map.todo.yaml first.
+                            # can_reader.py refuses to start if this file is missing.
+  gap_timeout_s: 1.0        # no-message-for-this-long is logged as a bus dropout/gap
+
+probe:
+  sca3300_duration_s: 60
+  can_discover_duration_s: 60

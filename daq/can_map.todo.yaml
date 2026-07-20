@@ -1,0 +1,72 @@
+# daq/can_map.todo.yaml
+#
+# This is a TEMPLATE. `can_discover.py` regenerates a version of this file
+# populated with the arbitration IDs it actually observed on the bus (rates,
+# sample payloads, J1939 PGN/SPN decode where applicable) -- run it on the
+# real vessel wiring and use ITS output, not this static example, as your
+# starting point.
+#
+# Nothing in this file is consumed directly by acquire.py / can_reader.py.
+# A human must review the candidates, confirm each one against a real
+# spin-up / throttle change on the actual engine, and copy the confirmed
+# entries into can_map.yaml (see config.yaml: can.map_file) using the same
+# schema. Do not promote an entry to can_map.yaml with confirmed: false.
+
+schema_version: 1
+
+# Candidates below are the PGN/SPN combinations the brief calls out as the
+# prime targets, using the standard published SAE J1939-71 byte layout
+# (see daq/j1939.py KNOWN_SIGNALS). They are starting points, not guesses
+# about *this* vessel's actual bus -- confirm arbitration ID, source
+# address, and units against real can_discover.py output.
+
+signals:
+  rpm:
+    protocol: j1939
+    pgn: 61444          # EEC1 - Electronic Engine Controller 1
+    spn: 190             # Engine Speed
+    byte_offset: 3        # 0-indexed byte within the 8-byte payload
+    length_bytes: 2
+    byte_order: little
+    resolution: 0.125     # rpm per bit
+    offset: 0.0
+    source_address: null  # fill in once can_discover.py shows which SA sends EEC1
+    confirmed: false
+
+  torque:
+    protocol: j1939
+    pgn: 61444           # EEC1
+    spn: 513              # Actual Engine - Percent Torque
+    byte_offset: 2
+    length_bytes: 1
+    byte_order: little
+    resolution: 1.0
+    offset: -125.0
+    source_address: null
+    confirmed: false
+
+  load:
+    protocol: j1939
+    pgn: 61443           # EEC2 - Electronic Engine Controller 2
+    spn: 92                # Engine Percent Load At Current Speed
+    byte_offset: 2
+    length_bytes: 1
+    byte_order: little
+    resolution: 1.0
+    offset: 0.0
+    source_address: null
+    confirmed: false
+
+# If the vessel bus turns out to be a proprietary (non-J1939) map instead,
+# use a "raw" entry shape instead of the "j1939" one above, e.g.:
+#
+#   rpm:
+#     protocol: raw
+#     can_id: 0x0CF00400   # exact arbitration ID observed
+#     is_extended: true
+#     byte_offset: 3
+#     length_bytes: 2
+#     byte_order: little
+#     resolution: 0.125
+#     offset: 0.0
+#     confirmed: false
