@@ -1,5 +1,0 @@
-__pycache__/
-*.pyc
-*.egg-info/
-venv/
-data/raw/*.npz

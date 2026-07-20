@@ -1,4 +1,0 @@
-spidev
-python-can
-numpy
-pyyaml

@@ -1,4 +1,0 @@
-# Grants the 'daq' service user SPI device access without root or the
-# broader image-default 'spi' group. See README "Deploying to a Raspberry Pi".
-
-SUBSYSTEM=="spidev", GROUP="daq", MODE="0660"
