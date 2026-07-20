@@ -224,8 +224,9 @@ class SCA3300:
         if status is not None and status.rs == RS_ERROR:
             raise SCA3300StartupError(f"RS still reports error after startup (raw status=0x{status.raw_value:03X})")
 
-        logger.info("SCA3300 startup complete: mode=%d whoami=0x%02X status=0x%03X rs=%02b",
-                    self.mode, whoami, status.raw_value if status else -1, status.rs if status else -1)
+        logger.info("SCA3300 startup complete: mode=%d whoami=0x%02X status=0x%03X rs=%s",
+                    self.mode, whoami, status.raw_value if status else -1,
+                    format(status.rs, "02b") if status else "??")
         return status
 
     def reinit(self) -> StatusFlags:

@@ -7,7 +7,9 @@ Two things live here, in build order:
 2. **A deterministic acquisition path** (`sca3300.py`, `acquire.py`,
    `can_reader.py`, `align.py`) that produces evenly-sampled vibration
    blocks and a time-aligned RPM/load/torque series for a later analytics
-   stage to consume.
+   stage to consume, built on a **shared clock** (`clock.py`) so more
+   sensors can be added later, each running concurrently on its own
+   thread but sharing one timebase -- see `CLOCKING.md`.
 
 **No FFT, order tracking, or health/diagnostics scoring is implemented
 here** -- that's a separate, later task. This folder only acquires and
@@ -24,6 +26,8 @@ prototype for the same sensor and were left untouched.
 ```
 daq/
 ├── sca3300.py            # SCA3300 SPI driver: startup, CRC/RS validation, reads
+├── clock.py               # SharedClock/Ticker/RealTimeSampler/SensorHub -- the
+│                          # multi-sensor-capable clocking mechanism (see CLOCKING.md)
 ├── probe_sca3300.py       # Task 1a: SCA3300 verification/discovery CLI
 ├── can_discover.py        # Task 1b: CAN adapter/bus discovery CLI
 ├── can_reader.py          # Task 2: background CAN signal reader
@@ -33,8 +37,17 @@ daq/
 ├── config.yaml            # all hardware-specific values (SPI, rates, CAN, etc.)
 ├── can_map.todo.yaml       # template the human fills in from can_discover.py output
 ├── requirements.txt
+├── CLOCKING.md             # multi-sensor clocking design + worked example
 ├── tests/
-│   └── test_align.py       # unit tests for align.py (interpolation correctness)
+│   ├── fakes.py             # SCA3300 protocol simulator (no hardware needed)
+│   ├── test_align.py        # align.py interpolation correctness
+│   ├── test_sca3300.py      # CRC/frame/startup/CRC-error-recovery, via fakes.py
+│   ├── test_j1939.py        # 29-bit ID decode, PGN/SPN signal extraction
+│   ├── test_can_reader.py   # can_map loading, message matching, timestamp offset
+│   ├── test_can_discover.py # adapter detection, bus analysis, can_map.todo.yaml schema
+│   ├── test_probe_sca3300.py# gravity/CRC-burst/timing-characterization logic
+│   ├── test_clock.py        # SharedClock/Ticker/RealTimeSampler/SensorHub
+│   └── test_acquire.py       # Acquirer end-to-end, via fakes.py
 └── README.md               # this file
 ```
 
@@ -97,8 +110,53 @@ python3 can_discover.py --duration 60
 
 # Task 2
 python3 acquire.py                 # runs until Ctrl+C
-python3 -m unittest discover -s tests   # align.py unit tests
 ```
+
+### Tests
+
+```bash
+cd daq
+python3 -m unittest discover -s tests
+```
+
+None of these require real hardware. `tests/fakes.py` implements a small
+SCA3300 protocol simulator (independent CRC-8 implementation, so a bug in
+`sca3300.py`'s own CRC code can't accidentally pass a test that checks
+itself) that reproduces the sensor's pipelined off-frame response
+behavior, including on-demand CRC-error injection at an exact transfer
+index -- used to test `sca3300.py`'s error detection and `acquire.py`'s
+reinit-on-error path end to end. CAN-side tests use synthetic
+`can.Message`s and hand-built J1939 IDs rather than a real bus (this
+sandbox has no `vcan`/`ip` tooling to bring up a virtual SocketCAN
+interface -- if your dev machine has `vcan`, wiring `can_discover.py`'s
+`sniff_bus()` against a real `vcan0` would be a natural next test to add).
+`tests/test_clock.py` covers the shared-clock/multi-sensor machinery
+directly, including a test that a fault in one sensor's read loop does not
+stop a second, concurrently-running sensor.
+
+What each file covers:
+- `test_sca3300.py` -- CRC/frame construction against 3 cross-referenced
+  known-good frames, startup success/failure paths, gravity-accurate
+  reads, CRC-error detection and recovery via reinit.
+- `test_j1939.py` -- 29-bit ID -> PGN/source-address decomposition
+  (broadcast and peer-to-peer), SPN byte extraction, edge cases.
+- `test_can_reader.py` -- `can_map.yaml` loading (missing-file error,
+  unconfirmed signals skipped), J1939/raw message matching, the
+  wall-clock-to-monotonic timestamp offset.
+- `test_can_discover.py` -- adapter-type detection (mocked `ip`/`dmesg`),
+  bus analysis (rate/candidate calculation, monotonicity check), and that
+  the generated `can_map.todo.yaml` schema matches what `can_reader.py`
+  actually expects (this exact mismatch was caught and fixed during
+  development -- see git history).
+- `test_probe_sca3300.py` -- gravity check pass/fail, CRC burst pass rate,
+  timing characterization shape and target-rate tracking.
+- `test_clock.py` -- deadline-grid alignment across different rates on one
+  clock, missed-deadline resync, block assembly/health tracking, and two
+  concurrent sensors on one `SensorHub` staying independent.
+- `test_acquire.py` -- the SCA3300-to-generic-sampler adapter and a full
+  `Acquirer` start/read-block/stop cycle, including optional disk logging.
+- `test_align.py` -- linear interpolation correctness, clamping outside
+  the series' range, and a full block-alignment scenario.
 
 ---
 
