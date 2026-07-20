@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "daq-sensor-acquisition"
+version = "0.1.0"
+description = "SCA3300 vibration + CAN RPM acquisition layer for shipboard condition monitoring"
+requires-python = ">=3.11"
+dependencies = [
+    "spidev",
+    "python-can",
+    "numpy",
+    "pyyaml",
+]
+
+# Flat modules, not a nested package -- matches how every module in this
+# folder already imports its neighbors (e.g. `from clock import SensorHub`),
+# so installing this doesn't change a single existing import anywhere.
+# acquire.py is included for its Acquirer class (a legitimate library
+# entry point, not just a CLI script); probe_sca3300.py/can_discover.py
+# are deliberately left out -- they're verification CLIs, not a library
+# surface. See README.md "Integration contract for other software".
+[tool.setuptools]
+py-modules = ["sca3300", "clock", "align", "can_reader", "j1939", "acquire"]

@@ -1,0 +1,44 @@
+# daq/deploy/daq-acquire.service
+#
+# Runs acquire.py as a long-lived system service: starts at boot, restarts
+# on crash, logs to the journal. Assumes the deployment layout documented
+# in README.md "Deploying to a Raspberry Pi": code at /opt/daq, a venv at
+# /opt/daq/venv, and a dedicated unprivileged 'daq' service user/group
+# (created by install.sh).
+#
+# CAP_SYS_NICE (not root) is granted here so the sampler thread(s) can get
+# SCHED_FIFO without running this whole process as root -- see README
+# "Required privileges". This only takes effect if a sensor's
+# realtime.use_sched_fifo is true in config.yaml; if you additionally set
+# realtime.required: true for a sensor and this capability is somehow
+# unavailable, acquire.py fails loudly at startup instead of silently
+# degrading (see clock.py's realtime_required).
+#
+# Install: see install.sh, or manually:
+#   sudo cp daq-acquire.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now daq-acquire.service
+# Logs:
+#   journalctl -u daq-acquire.service -f
+
+[Unit]
+Description=DAQ sensor acquisition (SCA3300 vibration + CAN RPM)
+After=network-online.target daq-can0-up.service
+Wants=network-online.target
+Requires=daq-can0-up.service
+
+[Service]
+Type=simple
+User=daq
+Group=daq
+SupplementaryGroups=spi
+WorkingDirectory=/opt/daq
+ExecStart=/opt/daq/venv/bin/python3 /opt/daq/acquire.py --config /opt/daq/config.yaml
+Restart=on-failure
+RestartSec=5
+
+AmbientCapabilities=CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_NICE
+
+[Install]
+WantedBy=multi-user.target

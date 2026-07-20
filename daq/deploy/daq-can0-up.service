@@ -1,0 +1,29 @@
+# daq/deploy/daq-can0-up.service
+#
+# Brings up the CAN interface at boot, before daq-acquire.service starts.
+# Raspberry Pi OS does not do this automatically for a SocketCAN interface
+# the way it does for Ethernet/WiFi.
+#
+# IMPORTANT: the bitrate below must match config.yaml's can.bitrate --
+# systemd units can't read the YAML directly, so keep these two in sync by
+# hand. can_discover.py will tell you the bus's real bitrate if you're not
+# sure; don't assume 250000.
+#
+# Install: see install.sh, or manually:
+#   sudo cp daq-can0-up.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now daq-can0-up.service
+
+[Unit]
+Description=Bring up CAN interface for daq acquisition
+After=multi-user.target
+Before=daq-acquire.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/ip link set can0 up type can bitrate 250000
+ExecStop=/sbin/ip link set can0 down
+
+[Install]
+WantedBy=multi-user.target

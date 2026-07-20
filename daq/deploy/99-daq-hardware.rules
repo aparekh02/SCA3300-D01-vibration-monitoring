@@ -1,0 +1,14 @@
+# daq/deploy/99-daq-hardware.rules
+#
+# Grants the 'daq' service user (via the 'daq' group) access to the SPI
+# device the SCA3300 is wired to, without needing to run as root or be a
+# member of the (broader, image-default) 'spi' group. Install alongside
+# daq-acquire.service's SupplementaryGroups=spi -- either mechanism alone
+# is normally enough; both are harmless together.
+#
+# Install: see install.sh, or manually:
+#   sudo cp 99-daq-hardware.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+
+SUBSYSTEM=="spidev", GROUP="daq", MODE="0660"

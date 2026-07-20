@@ -195,7 +195,7 @@ scheduling, no CPU isolation -- i.e. *not* the target Pi setup):
 | Scenario | intervals outside +-5% of 500us |
 |---|---|
 | One 2kHz sensor, no contention | ~8% (virtualization/scheduling jitter alone) |
-| Two 2kHz sensors, concurrent | ~20-40%, run to run |
+| Two 2kHz sensors, concurrent | ~20-40% typically, spiking past 60% on a noisier run |
 
 Reducing `spin_margin_us` (less time spent in the tight spin, more in a
 real `time.sleep()` that actually releases the GIL) gives a modest

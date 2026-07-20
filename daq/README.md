@@ -19,6 +19,13 @@ This folder does not touch or depend on anything in `src/`, `data/`, or
 `archive/` at the repo root; those are a separate, already-working 100Hz
 prototype for the same sensor and were left untouched.
 
+This is a hardware-facing system layer, meant to run as a standing service
+on the Pi that other software (analytics, dashboards, alerting) builds on
+top of -- not a script someone launches by hand each time. See "Deploying
+to a Raspberry Pi" below for the production install (systemd service, boot
+config, upload/update commands) and "Integration contract for other
+software" for what other code on the same Pi can actually depend on.
+
 ---
 
 ## Layout
@@ -37,8 +44,14 @@ daq/
 ├── config.yaml            # all hardware-specific values (SPI, rates, CAN, etc.)
 ├── can_map.todo.yaml       # template the human fills in from can_discover.py output
 ├── requirements.txt
+├── pyproject.toml          # `pip install -e .` packaging -- see "Integration contract"
 ├── CLOCKING.md             # multi-sensor clocking design + worked example
 ├── HARDWARE_TESTING.md     # how to run tests/hardware/ on real hardware
+├── deploy/                 # production install: systemd units, udev rule, install script
+│   ├── install.sh            # run this on the Pi -- see "Deploying to a Raspberry Pi"
+│   ├── daq-acquire.service
+│   ├── daq-can0-up.service
+│   └── 99-daq-hardware.rules
 ├── tests/
 │   ├── fakes.py             # SCA3300 protocol simulator (no hardware needed)
 │   ├── test_align.py        # align.py interpolation correctness
@@ -59,7 +72,7 @@ daq/
 
 ---
 
-## Setup
+## Setup (local dev iteration, e.g. SSH'd into the Pi directly)
 
 ```bash
 cd daq
@@ -76,6 +89,12 @@ Requires Python 3.11+ on Raspberry Pi OS with:
   ```
   (`can_discover.py` will tell you the actual driver/bitrate situation --
   don't assume 250000 without confirming.)
+
+This section is for iterating on the code directly on a Pi you already
+have shell access to. **For a production install other software will run
+against, see "Deploying to a Raspberry Pi" below** -- that's the one with
+the systemd service, boot-time CAN bring-up, and the actual upload/update
+commands.
 
 ### Required privileges
 
@@ -125,6 +144,184 @@ python3 can_discover.py --duration 60
 # Task 2
 python3 acquire.py                 # runs until Ctrl+C
 ```
+
+---
+
+## Deploying to a Raspberry Pi (production install)
+
+This is a hardware-facing acquisition layer other software (analytics,
+dashboards, alerting -- whatever consumes vibration blocks and RPM) is
+meant to run on top of, not just a script you launch by hand. That means
+treating it like firmware: a fixed install location, a system service
+that starts at boot and restarts on crash, boot-time CAN bring-up, and a
+documented, stable surface other software can actually depend on. The
+`daq/deploy/` directory has everything this section installs.
+
+**Target**: Raspberry Pi OS (Bookworm or newer) on a Pi with the SCA3300
+wired over SPI and a USB-CAN adapter attached, Python 3.11+.
+
+### 1. Prepare the Pi (one-time, before any code goes on it)
+
+```bash
+sudo raspi-config   # Interface Options -> SPI -> enable, then reboot
+```
+
+Wire the SCA3300 to the SPI bus/CS line `config.yaml` will reference, and
+plug in the USB-CAN adapter. Confirm both are visible before going further:
+
+```bash
+ls /dev/spidev*                 # should list e.g. /dev/spidev0.0
+ip link show                    # should list a CAN interface, e.g. can0
+```
+
+If `ip link show` doesn't show a CAN interface at all, check
+`dmesg | tail` for the adapter's driver load messages before assuming
+anything about config -- that's a wiring/driver problem, not a software one.
+
+### 2. Upload the code
+
+From your dev machine, with this repo checked out locally. This deploys
+**only `daq/`** (not the rest of this monorepo) to a fixed, documented
+location, `/opt/daq` -- that's the path the systemd units in `daq/deploy/`
+assume, so don't relocate it without editing them.
+
+```bash
+# Recommended: rsync just the daq/ subtree, excluding local test/build
+# artifacts that shouldn't travel with a deploy.
+rsync -avz --delete \
+    --exclude '__pycache__' --exclude '.pytest_cache' \
+    --exclude 'data/raw/*.npz' --exclude 'venv' \
+    ./daq/ pi@<pi-host>:/opt/daq/
+```
+
+If your team instead tracks this repo's git history directly on the Pi
+(e.g. to `git log`/`git blame` in place), clone the whole repo and treat
+`/opt/daq` as a symlink into it instead:
+
+```bash
+ssh pi@<pi-host> "git clone --branch <branch> <repo-url> /opt/vibration-monitoring && \
+                   sudo ln -s /opt/vibration-monitoring/daq /opt/daq"
+```
+
+Either way, `/opt/daq` should end up containing this folder's contents,
+owned by whatever user will run `install.sh` next (that user needs
+`sudo`; `install.sh` itself creates the actual service account).
+
+### 3. Install as a system service
+
+```bash
+ssh pi@<pi-host>
+cd /opt/daq/deploy
+sudo ./install.sh
+```
+
+`install.sh` is idempotent (safe to re-run after every update) and:
+- creates an unprivileged `daq` system user/group and gives it ownership
+  of `/opt/daq`,
+- creates a venv at `/opt/daq/venv` and `pip install -e`s this package
+  into it (see "Integration contract for other software" below for what
+  that buys other code on the same Pi),
+- installs `99-daq-hardware.rules` (SPI device permissions for the `daq`
+  group) and reloads udev,
+- installs and enables `daq-can0-up.service` (brings `can0` up at boot at
+  the bitrate hardcoded in that unit -- **keep it in sync with
+  `config.yaml`'s `can.bitrate` by hand**, systemd can't read the YAML)
+  and `daq-acquire.service` (runs `acquire.py` as the `daq` user, restarts
+  on failure, grants `CAP_SYS_NICE` via `AmbientCapabilities` so
+  `SCHED_FIFO` works without running as root -- see "Required privileges"
+  above for why that matters).
+
+```bash
+systemctl status daq-acquire.service     # confirm it's running
+journalctl -u daq-acquire.service -f     # tail its logs (health, blocks emitted, errors)
+```
+
+### 4. Verify before relying on it
+
+Installing the service is not the same as validating the hardware. Before
+treating a deployment as live:
+
+```bash
+# on the Pi, service stopped so it isn't fighting over the SPI/CAN devices
+sudo systemctl stop daq-acquire.service
+cd /opt/daq && source venv/bin/activate
+python3 probe_sca3300.py --duration 60
+python3 can_discover.py --duration 60
+# review can_map.todo.yaml, confirm entries against a real spin-up, save as can_map.yaml
+DAQ_RUN_HARDWARE_TESTS=1 python3 -m unittest tests.hardware.test_sca3300_hardware tests.hardware.test_can_hardware -v
+sudo systemctl start daq-acquire.service
+```
+
+See `HARDWARE_TESTING.md` for the full test suite, including the
+long-running soak test that certifies the actual Task 2 acceptance
+criterion (`DAQ_RUN_SOAK_TEST=1`).
+
+### 5. Updating a deployed instance
+
+```bash
+rsync -avz --delete --exclude '__pycache__' --exclude 'data/raw/*.npz' --exclude 'venv' \
+    ./daq/ pi@<pi-host>:/opt/daq/
+ssh pi@<pi-host> "cd /opt/daq/deploy && sudo ./install.sh && sudo systemctl restart daq-acquire.service"
+```
+
+`--exclude venv` above matters: without it, an rsync `--delete` would wipe
+out the Pi's installed virtualenv along with the source, since `venv/`
+only exists on the Pi, not in your local checkout.
+
+### 6. Uninstalling
+
+```bash
+sudo systemctl disable --now daq-acquire.service daq-can0-up.service
+sudo rm /etc/systemd/system/daq-acquire.service /etc/systemd/system/daq-can0-up.service
+sudo rm /etc/udev/rules.d/99-daq-hardware.rules
+sudo systemctl daemon-reload
+sudo userdel daq   # only if no other service or data still needs that account
+```
+
+---
+
+## Integration contract for other software
+
+What another team's software running on the same Pi can actually depend
+on today -- and, just as importantly, what it can't yet:
+
+- **Python import surface**: after `pip install -e /opt/daq` (which
+  `install.sh` already does into `/opt/daq/venv` -- point another
+  service's own venv at the same `-e /opt/daq` install, or activate that
+  venv directly) these modules are importable from anywhere:
+  `sca3300`, `clock` (`SharedClock`/`Ticker`/`RealTimeSampler`/
+  `SensorHub`), `align`, `can_reader`, `j1939`, and `acquire` (for its
+  `Acquirer` class). This is the same set `pyproject.toml` declares under
+  `[tool.setuptools] py-modules`. `probe_sca3300.py`/`can_discover.py` are
+  deliberately not part of this surface -- they're verification CLIs, run
+  them as scripts, not imports.
+- **On-disk vibration blocks**: with `logging.write_blocks_to_disk: true`
+  in `config.yaml`, each sensor writes `<raw_dir>/<sensor_name>_<t0_ns>.npz`
+  containing `samples` (an `(n, 3)` array, columns X/Y/Z in g),
+  `t0_ns` (monotonic timestamp of the first sample), `sample_rate_hz`, and
+  `missed_in_block`. There's no push/pub-sub mechanism for these files
+  today -- a consumer needs to poll or watch `raw_dir` itself (e.g. with
+  `watchdog` or a simple directory poll).
+- **In-process-only today (not yet on disk)**: the CAN RPM/load/torque
+  series (`CanReader.series_snapshot(name)`) and live health status
+  (`Acquirer.health_status()`) are currently only available to code
+  running in the *same process* as `acquire.py` -- there is no file or
+  socket export of either yet. A separate consumer process can currently
+  only get the raw vibration blocks above, not aligned RPM alongside them.
+  If your software needs cross-process access to either, that's a
+  reasonable follow-up (e.g. periodically appending CAN series to disk,
+  or a small local metrics/status endpoint) but isn't built -- don't
+  assume it exists.
+- **`align.py` is the seam, not a finished pipeline**: it's built and unit
+  tested (linear interpolation of a `(t, value)` series onto a block's
+  sample window) but nothing in `acquire.py` calls it automatically today.
+  Consuming code that wants vibration-block-aligned RPM currently has to
+  call `align_block()` itself with a vibration block and a CAN series --
+  see `CLOCKING.md`'s worked example.
+- **Versioning**: `pyproject.toml` currently pins `version = "0.1.0"` and
+  there's no changelog yet -- if other software starts depending on this
+  package, bumping that version on breaking changes (and noting them
+  somewhere) is a reasonable next step, not something already in place.
 
 ### Tests
 
