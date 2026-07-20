@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-The real Task 2 acceptance test from the original brief, run against real
-hardware end to end: >=60s at 2kHz (or whatever config.yaml specifies),
-~0 missed samples, p99 within +-5% of target -- through the actual
-Acquirer/SensorHub/RealTimeSampler path, not just sca3300.py directly.
-
-This is deliberately separate from test_sca3300_hardware.py's timing
-check: that one exercises sca3300.py's read loop directly; this one
-exercises the FULL acquire.py path (SCHED_FIFO, CPU pinning, block
-assembly, health aggregation across however many sensors config.yaml
-lists) -- the thing that's actually shipped.
+The real Task 2 acceptance test, run through the actual
+Acquirer/SensorHub/RealTimeSampler path (not sca3300.py directly, unlike
+test_sca3300_hardware.py's timing check): >=60s at 2kHz, ~0 missed
+samples, p99 within +-5% of target, on real hardware.
 
 Run with (see HARDWARE_TESTING.md for full details):
     DAQ_RUN_HARDWARE_TESTS=1 DAQ_RUN_SOAK_TEST=1 python3 -m unittest tests.hardware.test_acquire_soak -v
 
-Defaults to a 60s run; override with DAQ_SOAK_DURATION_S. This is
-intentionally gated behind a SECOND env var beyond DAQ_RUN_HARDWARE_TESTS
-since it is slow by design and shouldn't fire just because the quicker
-hardware tests were requested.
+Gated behind a second env var (slow by design) so it doesn't fire just
+because the quicker hardware tests were requested. Override the 60s
+default with DAQ_SOAK_DURATION_S.
 """
 
 import os

@@ -7,7 +7,7 @@ tests; FFT/diagnostics that consume the aligned RPM are a later task.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Sequence
 
 import numpy as np
 
@@ -19,15 +19,8 @@ def block_sample_times(t0: float, n_samples: int, sample_rate_hz: float) -> np.n
 
 def interpolate_series(series: Sequence[tuple], query_times: np.ndarray) -> np.ndarray:
     """Linearly interpolate a (time, value) series onto query_times.
-
     Times outside the series' range are clamped to the nearest endpoint
-    value (numpy.interp's default behavior) rather than extrapolated --
-    documented here since silent extrapolation of RPM past real data would
-    be misleading.
-
-    Returns an array of NaN (same length as query_times) if `series` is
-    empty, since there is nothing to interpolate.
-    """
+    (not extrapolated). Returns all-NaN if `series` is empty."""
     query_times = np.asarray(query_times, dtype=float)
     if not series:
         return np.full(query_times.shape, np.nan)

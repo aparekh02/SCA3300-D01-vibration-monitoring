@@ -14,12 +14,8 @@ dependencies = [
     "pyyaml",
 ]
 
-# Flat modules, not a nested package -- matches how every module in this
-# folder already imports its neighbors (e.g. `from clock import SensorHub`),
-# so installing this doesn't change a single existing import anywhere.
-# acquire.py is included for its Acquirer class (a legitimate library
-# entry point, not just a CLI script); probe_sca3300.py/can_discover.py
-# are deliberately left out -- they're verification CLIs, not a library
-# surface. See README.md "Integration contract for other software".
+# Flat modules (matches existing intra-package imports); probe_sca3300.py/
+# can_discover.py excluded, they're verification CLIs not a library surface.
+# See README.md "Integration contract for other software".
 [tool.setuptools]
 py-modules = ["sca3300", "clock", "align", "can_reader", "j1939", "acquire"]

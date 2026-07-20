@@ -1,21 +1,9 @@
 #!/usr/bin/env bash
-# daq/deploy/install.sh
-#
-# Installs this daq/ tree as a system service on a Raspberry Pi. Run this
-# ON THE PI, after uploading the code (see README.md "Deploying to a
-# Raspberry Pi" for the upload step) -- it does not copy any code itself.
-#
-# Assumes the deployment layout the systemd units in this directory
-# reference: this script's parent directory (daq/) deployed to /opt/daq.
-# Run from wherever you actually uploaded it; if that isn't /opt/daq,
-# edit WorkingDirectory/ExecStart in daq-acquire.service to match before
-# running this.
-#
-# Usage:
-#   cd /opt/daq/deploy && sudo -E ./install.sh
-#
-# Idempotent: safe to re-run after an update (e.g. after re-syncing new
-# code) to reinstall the venv/units/udev rule.
+# Installs this daq/ tree as a system service. Run ON THE PI after
+# uploading the code (see README.md "Deploying to a Raspberry Pi") --
+# doesn't copy code itself. Assumes /opt/daq (edit daq-acquire.service's
+# paths if deployed elsewhere). Idempotent: safe to re-run after an update.
+# Usage: cd /opt/daq/deploy && sudo -E ./install.sh
 
 set -euo pipefail
 

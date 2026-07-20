@@ -5,14 +5,11 @@
 # Confirm each field marked "CONFIRM" against the real installation before
 # trusting Task 2's output.
 
-# One entry per sensor acquire.py should run. Each gets its own real-time
-# thread/queue/health-monitor/fault-domain via clock.SensorHub, sharing one
-# clock -- see CLOCKING.md. Only "sca3300" is implemented today (it's the
-# only sensor this build has); adding a second physical SCA3300 (a
-# different bearing, a different CS line) is just another list entry with
-# a unique `name` and its own `spi`/`sampling`/`realtime` block. Adding a
-# genuinely different sensor *type* means teaching acquire.py how to build
-# its read_fn (see acquire.py's _register_sensor()), same as sca3300's.
+# One entry per sensor acquire.py should run (own thread/queue/health via
+# clock.SensorHub, sharing one clock -- see CLOCKING.md). Only "sca3300" is
+# implemented; a second physical SCA3300 is just another list entry with a
+# unique `name`. A genuinely different sensor type needs acquire.py's
+# _register_sensor() taught how to build its read_fn.
 sensors:
   - name: vibration_main
     type: sca3300
@@ -30,19 +27,12 @@ sensors:
       queue_maxsize: 8          # in-memory block queue depth before oldest blocks are dropped
     realtime:
       use_sched_fifo: true
-      required: false          # if true, acquire.py refuses to start this sensor rather than
-                                # silently falling back to normal scheduling when SCHED_FIFO
-                                # can't be obtained (no root/CAP_SYS_NICE) -- see README
-                                # "Required privileges". health_status() also reports
-                                # sched_fifo_active/cpu_pinned either way.
+      required: false          # if true, refuse to start rather than silently fall back to
+                                # normal scheduling when SCHED_FIFO is denied -- see README.
       priority: 80             # SCHED_FIFO priority (1-99); requires root or CAP_SYS_NICE
       cpu_core: null            # CONFIRM: an isolated core number (see README "isolcpus"), e.g. 3.
-                                # null = no CPU pinning attempted.
-      spin_margin_us: 50        # tail of each tick spent busy-waiting (vs. sleeping) for precision.
-                                # Measured effect is modest and host-dependent -- see CLOCKING.md
-                                # "GIL and concurrent high-rate sensors" for real numbers from this
-                                # build; don't expect tuning this alone to hit +-5% jitter with
-                                # several concurrent high-rate sensors on a non-isolated core.
+      spin_margin_us: 50        # tail of each tick spent busy-waiting vs. sleeping, for precision --
+                                # see CLOCKING.md "GIL and concurrent high-rate sensors".
 
 logging:
   write_blocks_to_disk: false   # if true, each block is also written under raw_dir

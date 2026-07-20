@@ -1,30 +1,22 @@
 # daq/ - Sensor Acquisition & Discovery Layer
 
-Two things live here, in build order:
+A hardware-facing acquisition layer meant to run as a standing service on
+the Pi, that other software (analytics, dashboards, alerting) builds on
+top of. Two things live here, in build order:
 
 1. **Verification/discovery tools** (`probe_sca3300.py`, `can_discover.py`) --
    run these first, on the real Pi/hardware, before trusting anything else.
 2. **A deterministic acquisition path** (`sca3300.py`, `acquire.py`,
    `can_reader.py`, `align.py`) that produces evenly-sampled vibration
-   blocks and a time-aligned RPM/load/torque series for a later analytics
-   stage to consume, built on a **shared clock** (`clock.py`) so more
-   sensors can be added later, each running concurrently on its own
-   thread but sharing one timebase -- see `CLOCKING.md`.
+   blocks and a time-aligned RPM/load/torque series, built on a **shared
+   clock** (`clock.py`) so more sensors can be added later, each running
+   concurrently on its own thread but sharing one timebase -- see
+   `CLOCKING.md`.
 
 **No FFT, order tracking, or health/diagnostics scoring is implemented
 here** -- that's a separate, later task. This folder only acquires and
-aligns data.
-
-This folder does not touch or depend on anything in `src/`, `data/`, or
-`archive/` at the repo root; those are a separate, already-working 100Hz
-prototype for the same sensor and were left untouched.
-
-This is a hardware-facing system layer, meant to run as a standing service
-on the Pi that other software (analytics, dashboards, alerting) builds on
-top of -- not a script someone launches by hand each time. See "Deploying
-to a Raspberry Pi" below for the production install (systemd service, boot
-config, upload/update commands) and "Integration contract for other
-software" for what other code on the same Pi can actually depend on.
+aligns data, and doesn't touch or depend on `src/`, `data/`, or `archive/`
+at the repo root (a separate, already-working 100Hz prototype).
 
 ---
 
@@ -54,18 +46,9 @@ daq/
 │   └── 99-daq-hardware.rules
 ├── tests/
 │   ├── fakes.py             # SCA3300 protocol simulator (no hardware needed)
-│   ├── test_align.py        # align.py interpolation correctness
-│   ├── test_sca3300.py      # CRC/frame/startup/CRC-error-recovery, via fakes.py
-│   ├── test_j1939.py        # 29-bit ID decode, PGN/SPN signal extraction
-│   ├── test_can_reader.py   # can_map loading, message matching, timestamp offset
-│   ├── test_can_discover.py # adapter detection, bus analysis, can_map.todo.yaml schema
-│   ├── test_probe_sca3300.py# gravity/CRC-burst/timing-characterization logic
-│   ├── test_clock.py        # SharedClock/Ticker/RealTimeSampler/SensorHub
-│   ├── test_acquire.py      # Acquirer end-to-end (incl. multi-sensor), via fakes.py
+│   ├── test_*.py            # one file per module, hardware-free (see "Tests")
 │   └── hardware/             # real-hardware-only tests, self-skip without opt-in env var
-│       ├── test_sca3300_hardware.py
-│       ├── test_can_hardware.py
-│       ├── test_acquire_soak.py
+│       ├── test_sca3300_hardware.py / test_can_hardware.py / test_acquire_soak.py
 │       └── watch_rpm.py       # manual can_map.yaml confirmation helper (not a test)
 └── README.md               # this file
 ```
@@ -87,49 +70,37 @@ Requires Python 3.11+ on Raspberry Pi OS with:
   ```bash
   sudo ip link set can0 up type can bitrate 250000
   ```
-  (`can_discover.py` will tell you the actual driver/bitrate situation --
-  don't assume 250000 without confirming.)
+  (`can_discover.py` will tell you the actual driver/bitrate -- don't
+  assume 250000 without confirming.)
 
-This section is for iterating on the code directly on a Pi you already
-have shell access to. **For a production install other software will run
-against, see "Deploying to a Raspberry Pi" below** -- that's the one with
-the systemd service, boot-time CAN bring-up, and the actual upload/update
-commands.
+For a production install other software will run against, see "Deploying
+to a Raspberry Pi" below instead.
 
 ### Required privileges
 
-- **SPI**: the user running these scripts needs read/write access to
-  `/dev/spidev*` (member of the `spi` group on most Raspberry Pi OS images,
-  or run as root).
-- **Real-time scheduling** (each sensor's sampler thread): `SCHED_FIFO`
-  requires root or `CAP_SYS_NICE`. Without it, the default
-  (`sensors[].realtime.required: false`) logs a warning and runs at normal
-  scheduling -- it still works, just with weaker timing guarantees under
-  system load. This is no longer a silent degradation, though: every
-  sampler's `health_status()` reports `sched_fifo_active` / `cpu_pinned`
-  booleans regardless of the warning log, and setting
-  `sensors[].realtime.required: true` turns a denial into a hard startup
-  failure instead of a log line easy to miss. Grant the capability instead
-  of running as root where possible:
+- **SPI**: needs read/write access to `/dev/spidev*` (member of the `spi`
+  group on most Raspberry Pi OS images, or root).
+- **Real-time scheduling**: `SCHED_FIFO` requires root or `CAP_SYS_NICE`.
+  Without it, the default (`sensors[].realtime.required: false`) logs a
+  warning and runs at normal scheduling. Every sampler's `health_status()`
+  reports `sched_fifo_active`/`cpu_pinned` regardless, and
+  `realtime.required: true` turns a denial into a hard startup failure
+  instead of a log line easy to miss. Grant the capability instead of
+  running as root where possible:
   ```bash
   sudo setcap cap_sys_nice+ep $(readlink -f $(which python3))
   ```
-- **CPU isolation** (recommended, not required): to give a sampler thread
-  a core with minimal OS jitter, isolate a core from the general scheduler
-  by adding to `/boot/cmdline.txt` (or `/boot/firmware/cmdline.txt` on
-  newer Raspberry Pi OS):
+- **CPU isolation** (recommended): isolate a core from the general
+  scheduler by adding to `/boot/cmdline.txt` (or `/boot/firmware/cmdline.txt`):
   ```
   isolcpus=3 nohz_full=3 rcu_nocbs=3
   ```
   then reboot and set that sensor's `realtime.cpu_core: 3` in
-  `config.yaml`. Adjust the core number for your Pi model (leave core 0
-  for the OS), and give each concurrently-running sensor its own isolated
-  core if you can -- see CLOCKING.md "GIL and concurrent high-rate
-  sensors" for why that matters more than it might seem for more than one
-  sensor at a high rate.
-- **CAN**: bringing an interface up (`ip link set ... up`) requires
-  `CAP_NET_ADMIN` (typically via `sudo`); reading/writing frames once it's
-  up does not.
+  `config.yaml` (leave core 0 for the OS). Give each concurrently-running
+  sensor its own isolated core if you can -- see CLOCKING.md "GIL and
+  concurrent high-rate sensors" for why.
+- **CAN**: bringing an interface up needs `CAP_NET_ADMIN` (via `sudo`);
+  reading/writing frames once it's up does not.
 
 ### Running
 
@@ -149,63 +120,45 @@ python3 acquire.py                 # runs until Ctrl+C
 
 ## Deploying to a Raspberry Pi (production install)
 
-This is a hardware-facing acquisition layer other software (analytics,
-dashboards, alerting -- whatever consumes vibration blocks and RPM) is
-meant to run on top of, not just a script you launch by hand. That means
-treating it like firmware: a fixed install location, a system service
+Treats this like firmware: a fixed install location, a systemd service
 that starts at boot and restarts on crash, boot-time CAN bring-up, and a
-documented, stable surface other software can actually depend on. The
-`daq/deploy/` directory has everything this section installs.
+stable surface other software can depend on. `daq/deploy/` has everything
+this section installs. Target: Raspberry Pi OS (Bookworm+), Python 3.11+.
 
-**Target**: Raspberry Pi OS (Bookworm or newer) on a Pi with the SCA3300
-wired over SPI and a USB-CAN adapter attached, Python 3.11+.
-
-### 1. Prepare the Pi (one-time, before any code goes on it)
+### 1. Prepare the Pi (one-time)
 
 ```bash
 sudo raspi-config   # Interface Options -> SPI -> enable, then reboot
 ```
 
-Wire the SCA3300 to the SPI bus/CS line `config.yaml` will reference, and
-plug in the USB-CAN adapter. Confirm both are visible before going further:
+Wire the SCA3300 and plug in the USB-CAN adapter, then confirm both are
+visible:
 
 ```bash
 ls /dev/spidev*                 # should list e.g. /dev/spidev0.0
 ip link show                    # should list a CAN interface, e.g. can0
 ```
 
-If `ip link show` doesn't show a CAN interface at all, check
-`dmesg | tail` for the adapter's driver load messages before assuming
-anything about config -- that's a wiring/driver problem, not a software one.
+If no CAN interface shows up, check `dmesg | tail` for driver load
+messages -- that's a wiring/driver problem, not config.
 
 ### 2. Upload the code
 
-From your dev machine, with this repo checked out locally. This deploys
-**only `daq/`** (not the rest of this monorepo) to a fixed, documented
-location, `/opt/daq` -- that's the path the systemd units in `daq/deploy/`
-assume, so don't relocate it without editing them.
+Deploys **only `daq/`** to a fixed location, `/opt/daq` -- the path the
+systemd units in `daq/deploy/` assume.
 
 ```bash
-# Recommended: rsync just the daq/ subtree, excluding local test/build
-# artifacts that shouldn't travel with a deploy.
 rsync -avz --delete \
-    --exclude '__pycache__' --exclude '.pytest_cache' \
-    --exclude 'data/raw/*.npz' --exclude 'venv' \
+    --exclude '__pycache__' --exclude 'data/raw/*.npz' --exclude 'venv' \
     ./daq/ pi@<pi-host>:/opt/daq/
 ```
 
-If your team instead tracks this repo's git history directly on the Pi
-(e.g. to `git log`/`git blame` in place), clone the whole repo and treat
-`/opt/daq` as a symlink into it instead:
+Or, if your team tracks this repo's git history on the Pi directly:
 
 ```bash
 ssh pi@<pi-host> "git clone --branch <branch> <repo-url> /opt/vibration-monitoring && \
                    sudo ln -s /opt/vibration-monitoring/daq /opt/daq"
 ```
-
-Either way, `/opt/daq` should end up containing this folder's contents,
-owned by whatever user will run `install.sh` next (that user needs
-`sudo`; `install.sh` itself creates the actual service account).
 
 ### 3. Install as a system service
 
@@ -215,113 +168,78 @@ cd /opt/daq/deploy
 sudo ./install.sh
 ```
 
-`install.sh` is idempotent (safe to re-run after every update) and:
-- creates an unprivileged `daq` system user/group and gives it ownership
-  of `/opt/daq`,
-- creates a venv at `/opt/daq/venv` and `pip install -e`s this package
-  into it (see "Integration contract for other software" below for what
-  that buys other code on the same Pi),
-- installs `99-daq-hardware.rules` (SPI device permissions for the `daq`
-  group) and reloads udev,
-- installs and enables `daq-can0-up.service` (brings `can0` up at boot at
-  the bitrate hardcoded in that unit -- **keep it in sync with
-  `config.yaml`'s `can.bitrate` by hand**, systemd can't read the YAML)
-  and `daq-acquire.service` (runs `acquire.py` as the `daq` user, restarts
-  on failure, grants `CAP_SYS_NICE` via `AmbientCapabilities` so
-  `SCHED_FIFO` works without running as root -- see "Required privileges"
-  above for why that matters).
+Idempotent (safe to re-run after an update). Creates an unprivileged `daq`
+system user, a venv at `/opt/daq/venv` with this package `pip install -e`d
+into it, installs `99-daq-hardware.rules` (SPI permissions), and installs
++ enables `daq-can0-up.service` (brings `can0` up at boot -- **keep its
+hardcoded bitrate in sync with `config.yaml`'s `can.bitrate` by hand**)
+and `daq-acquire.service` (runs `acquire.py` as the `daq` user, auto-
+restarts, grants `CAP_SYS_NICE` via `AmbientCapabilities`).
 
 ```bash
 systemctl status daq-acquire.service     # confirm it's running
-journalctl -u daq-acquire.service -f     # tail its logs (health, blocks emitted, errors)
+journalctl -u daq-acquire.service -f     # tail its logs
 ```
 
 ### 4. Verify before relying on it
 
-Installing the service is not the same as validating the hardware. Before
-treating a deployment as live:
-
 ```bash
-# on the Pi, service stopped so it isn't fighting over the SPI/CAN devices
-sudo systemctl stop daq-acquire.service
+sudo systemctl stop daq-acquire.service   # free the SPI/CAN devices first
 cd /opt/daq && source venv/bin/activate
 python3 probe_sca3300.py --duration 60
 python3 can_discover.py --duration 60
-# review can_map.todo.yaml, confirm entries against a real spin-up, save as can_map.yaml
+# review can_map.todo.yaml, confirm against a real spin-up, save as can_map.yaml
 DAQ_RUN_HARDWARE_TESTS=1 python3 -m unittest tests.hardware.test_sca3300_hardware tests.hardware.test_can_hardware -v
 sudo systemctl start daq-acquire.service
 ```
 
-See `HARDWARE_TESTING.md` for the full test suite, including the
-long-running soak test that certifies the actual Task 2 acceptance
-criterion (`DAQ_RUN_SOAK_TEST=1`).
+See `HARDWARE_TESTING.md` for the full suite, including the soak test
+that certifies Task 2's actual acceptance criterion (`DAQ_RUN_SOAK_TEST=1`).
 
-### 5. Updating a deployed instance
+### 5. Updating / uninstalling
 
 ```bash
+# update
 rsync -avz --delete --exclude '__pycache__' --exclude 'data/raw/*.npz' --exclude 'venv' \
     ./daq/ pi@<pi-host>:/opt/daq/
 ssh pi@<pi-host> "cd /opt/daq/deploy && sudo ./install.sh && sudo systemctl restart daq-acquire.service"
-```
 
-`--exclude venv` above matters: without it, an rsync `--delete` would wipe
-out the Pi's installed virtualenv along with the source, since `venv/`
-only exists on the Pi, not in your local checkout.
-
-### 6. Uninstalling
-
-```bash
+# uninstall
 sudo systemctl disable --now daq-acquire.service daq-can0-up.service
-sudo rm /etc/systemd/system/daq-acquire.service /etc/systemd/system/daq-can0-up.service
-sudo rm /etc/udev/rules.d/99-daq-hardware.rules
+sudo rm /etc/systemd/system/daq-{acquire,can0-up}.service /etc/udev/rules.d/99-daq-hardware.rules
 sudo systemctl daemon-reload
-sudo userdel daq   # only if no other service or data still needs that account
+sudo userdel daq   # only if nothing else needs that account
 ```
+
+(`--exclude venv` matters for updates: `venv/` only exists on the Pi, and
+`--delete` would otherwise wipe it since it isn't in your local checkout.)
 
 ---
 
 ## Integration contract for other software
 
-What another team's software running on the same Pi can actually depend
-on today -- and, just as importantly, what it can't yet:
+What another team's software on the same Pi can depend on today, and
+what it can't yet:
 
-- **Python import surface**: after `pip install -e /opt/daq` (which
-  `install.sh` already does into `/opt/daq/venv` -- point another
-  service's own venv at the same `-e /opt/daq` install, or activate that
-  venv directly) these modules are importable from anywhere:
-  `sca3300`, `clock` (`SharedClock`/`Ticker`/`RealTimeSampler`/
-  `SensorHub`), `align`, `can_reader`, `j1939`, and `acquire` (for its
-  `Acquirer` class). This is the same set `pyproject.toml` declares under
-  `[tool.setuptools] py-modules`. `probe_sca3300.py`/`can_discover.py` are
-  deliberately not part of this surface -- they're verification CLIs, run
-  them as scripts, not imports.
-- **On-disk vibration blocks**: with `logging.write_blocks_to_disk: true`
-  in `config.yaml`, each sensor writes `<raw_dir>/<sensor_name>_<t0_ns>.npz`
-  containing `samples` (an `(n, 3)` array, columns X/Y/Z in g),
-  `t0_ns` (monotonic timestamp of the first sample), `sample_rate_hz`, and
-  `missed_in_block`. There's no push/pub-sub mechanism for these files
-  today -- a consumer needs to poll or watch `raw_dir` itself (e.g. with
-  `watchdog` or a simple directory poll).
-- **In-process-only today (not yet on disk)**: the CAN RPM/load/torque
-  series (`CanReader.series_snapshot(name)`) and live health status
-  (`Acquirer.health_status()`) are currently only available to code
-  running in the *same process* as `acquire.py` -- there is no file or
-  socket export of either yet. A separate consumer process can currently
-  only get the raw vibration blocks above, not aligned RPM alongside them.
-  If your software needs cross-process access to either, that's a
-  reasonable follow-up (e.g. periodically appending CAN series to disk,
-  or a small local metrics/status endpoint) but isn't built -- don't
-  assume it exists.
-- **`align.py` is the seam, not a finished pipeline**: it's built and unit
-  tested (linear interpolation of a `(t, value)` series onto a block's
-  sample window) but nothing in `acquire.py` calls it automatically today.
-  Consuming code that wants vibration-block-aligned RPM currently has to
-  call `align_block()` itself with a vibration block and a CAN series --
-  see `CLOCKING.md`'s worked example.
-- **Versioning**: `pyproject.toml` currently pins `version = "0.1.0"` and
-  there's no changelog yet -- if other software starts depending on this
-  package, bumping that version on breaking changes (and noting them
-  somewhere) is a reasonable next step, not something already in place.
+- **Python import surface**: after `pip install -e /opt/daq` (already
+  done by `install.sh`), `sca3300`, `clock`, `align`, `can_reader`,
+  `j1939`, and `acquire` (for `Acquirer`) are importable from anywhere --
+  the same set `pyproject.toml` declares. `probe_sca3300.py`/
+  `can_discover.py` are verification CLIs, not part of this surface.
+- **On-disk vibration blocks**: with `logging.write_blocks_to_disk: true`,
+  each sensor writes `<raw_dir>/<sensor_name>_<t0_ns>.npz` containing
+  `samples` ((n,3) g array), `t0_ns`, `sample_rate_hz`, `missed_in_block`.
+  No push/pub-sub -- a consumer polls or watches `raw_dir` itself.
+- **In-process only today**: CAN RPM/load/torque
+  (`CanReader.series_snapshot()`) and live health (`Acquirer.health_status()`)
+  are only available to code in the *same process* as `acquire.py` -- no
+  file/socket export yet. A separate consumer only gets raw vibration
+  blocks, not aligned RPM alongside them.
+- **`align.py` is the seam, not a finished pipeline**: built and unit
+  tested, but nothing in `acquire.py` calls it automatically -- consumers
+  call `align_block()` themselves (see `CLOCKING.md`'s worked example).
+- **Versioning**: `pyproject.toml` pins `0.1.0`, no changelog yet -- bump
+  on breaking changes once other software actually depends on this.
 
 ### Tests
 
@@ -330,245 +248,158 @@ cd daq
 python3 -m unittest discover -s tests
 ```
 
-This is the hardware-free suite covered below -- it also includes
-`tests/hardware/`, but those self-skip unless explicitly opted into (see
-`HARDWARE_TESTING.md`), so this command is always safe to run, including
-in this build environment. Once you have the real Pi/sensor/CAN adapter,
-run `HARDWARE_TESTING.md`'s suite too -- it's the only thing that actually
-certifies real-hardware behavior rather than protocol/logic correctness.
+Always safe to run anywhere, including this build environment -- it
+includes `tests/hardware/`, but those self-skip unless opted into (see
+`HARDWARE_TESTING.md`).
 
-None of these require real hardware. `tests/fakes.py` implements a small
-SCA3300 protocol simulator (independent CRC-8 implementation, so a bug in
-`sca3300.py`'s own CRC code can't accidentally pass a test that checks
-itself) that reproduces the sensor's pipelined off-frame response
-behavior, including on-demand CRC-error injection at an exact transfer
-index -- used to test `sca3300.py`'s error detection and `acquire.py`'s
-reinit-on-error path end to end. CAN-side tests use synthetic
-`can.Message`s and hand-built J1939 IDs rather than a real bus (this
-sandbox has no `vcan`/`ip` tooling to bring up a virtual SocketCAN
-interface -- if your dev machine has `vcan`, wiring `can_discover.py`'s
-`sniff_bus()` against a real `vcan0` would be a natural next test to add).
-`tests/test_clock.py` covers the shared-clock/multi-sensor machinery
-directly, including a test that a fault in one sensor's read loop does not
-stop a second, concurrently-running sensor.
+`tests/fakes.py` simulates the SCA3300 protocol (independent CRC-8
+implementation, so a bug in `sca3300.py`'s own CRC can't pass a test that
+checks itself), including precise CRC-error injection. CAN tests use
+synthetic `can.Message`s and hand-built J1939 IDs (no `vcan` available in
+this sandbox to test against a real virtual bus).
 
-What each file covers:
-- `test_sca3300.py` -- CRC/frame construction against 3 cross-referenced
-  known-good frames, startup success/failure paths, gravity-accurate
-  reads, CRC-error detection and recovery via reinit.
-- `test_j1939.py` -- 29-bit ID -> PGN/source-address decomposition
-  (broadcast and peer-to-peer), SPN byte extraction, edge cases.
-- `test_can_reader.py` -- `can_map.yaml` loading (missing-file error,
-  unconfirmed signals skipped), J1939/raw message matching, the
+- `test_sca3300.py` -- CRC/frame construction, startup success/failure,
+  gravity-accurate reads, CRC-error detection and reinit recovery.
+- `test_j1939.py` -- 29-bit ID -> PGN/SA decomposition, SPN extraction.
+- `test_can_reader.py` -- `can_map.yaml` loading, message matching,
   wall-clock-to-monotonic timestamp offset.
-- `test_can_discover.py` -- adapter-type detection (mocked `ip`/`dmesg`),
-  bus analysis (rate/candidate calculation, monotonicity check), and that
-  the generated `can_map.todo.yaml` schema matches what `can_reader.py`
-  actually expects (this exact mismatch was caught and fixed during
-  development -- see git history).
-- `test_probe_sca3300.py` -- gravity check pass/fail, CRC burst pass rate,
-  timing characterization shape and target-rate tracking.
-- `test_clock.py` -- deadline-grid alignment across different rates on one
-  clock, missed-deadline resync, block assembly/health tracking, two
-  concurrent sensors on one `SensorHub` staying independent,
-  `realtime.required` actually raising on a denied SCHED_FIFO request (and
-  rolling back any sensors already started), the O(1)-eviction regression
-  guard for the rolling health window, and a measured (not asserted-away)
-  characterization of GIL contention between two concurrent 2kHz sensors
-  -- see CLOCKING.md "GIL and concurrent high-rate sensors" for the actual
-  numbers this produced.
-- `test_acquire.py` -- the SCA3300-to-generic-sampler adapter, a full
-  `Acquirer` start/read-block/stop cycle including optional disk logging,
-  and a config-driven two-sensor scenario proving `sensors:` list entries
-  alone (no extra code) are enough to run two independent SCA3300 units
-  concurrently.
-- `test_align.py` -- linear interpolation correctness, clamping outside
-  the series' range, and a full block-alignment scenario.
+- `test_can_discover.py` -- adapter detection, bus analysis, and that the
+  generated `can_map.todo.yaml` schema matches what `can_reader.py` needs.
+- `test_probe_sca3300.py` -- gravity/CRC-burst/timing-characterization logic.
+- `test_clock.py` -- deadline-grid alignment, missed-deadline resync,
+  block/health tracking, two sensors staying independent,
+  `realtime.required` raising (with rollback), and a measured (not
+  asserted-away) GIL-contention characterization -- see CLOCKING.md.
+- `test_acquire.py` -- the SCA3300 adapter, a full `Acquirer` cycle, and a
+  config-driven two-sensor scenario (no extra code, just `sensors:` entries).
+- `test_align.py` -- interpolation correctness, range clamping, block alignment.
 
 ---
 
 ## Datasheet assumptions -- what's confirmed vs. still needs a check
 
-This build environment could not reach a browser-rendered copy of the
-primary Murata SCA3300-D01 PDF directly (fetches to the Mouser/Murata/LCSC
-PDF hosts returned 403 from here). Instead, every SPI-protocol constant
-below was **cross-verified against three independent sources that all
-agree**, rather than invented:
+This build environment couldn't reach the primary Murata SCA3300-D01 PDF
+(Mouser/Murata/LCSC hosts all 403'd). Instead, every SPI-protocol constant
+was **cross-verified against three independent sources that all agree**:
 
 1. This repo's own already-tested driver, `src/vibration_monitor.py`,
-   whose exact frame bytes produced the real hardware output logged in
-   `example_run.md` (`RS after startup: 01`, etc.).
-2. Murata's official Linux kernel IIO driver,
-   `drivers/iio/accel/sca3300.c` (upstream `torvalds/linux`), which
-   documents the CRC-8 polynomial, register map, and per-mode scale/LPF
-   tables in its source comments.
-3. The `algebratech/sca3300-driver` Python reference implementation, which
-   contains the literal 32-bit command frames as hex constants.
+   whose frame bytes produced the real output in `example_run.md`.
+2. Murata's Linux IIO kernel driver (`drivers/iio/accel/sca3300.c`).
+3. The `algebratech/sca3300-driver` Python reference implementation.
 
-`daq/sca3300.py` doesn't hardcode those hex frames -- it builds each frame
-from a register address + read/write bit and computes the CRC live, then
-this build verified programmatically (see commit) that every frame it
-produces matches all three sources' literal bytes exactly (SW_RESET,
-mode-1 select, STATUS read, ACC_X/Y/Z read, WHOAMI read).
+`sca3300.py` builds each frame from a register address + CRC computed
+live (doesn't hardcode hex constants), verified programmatically to match
+all three sources' literal bytes exactly (SW_RESET, mode-1 select, STATUS,
+ACC_X/Y/Z, WHOAMI).
 
-### Confirmed (cross-referenced, byte-exact match across all 3 sources)
+### Confirmed (byte-exact match across all 3 sources)
 
-- SPI mode 0 (CPOL=0, CPHA=0), 32-bit frames, MSB-first.
-- CRC-8: polynomial `0x1D`, init `0xFF`, computed over the first 3 bytes of
-  the frame, transmitted value is the bitwise NOT of the raw result.
+- SPI mode 0, 32-bit frames, MSB-first.
+- CRC-8: poly `0x1D`, init `0xFF`, over the first 3 bytes, transmitted
+  value is the bitwise NOT of the raw result.
 - Frame byte 0 = `(write << 7) | (register_address << 2)` for requests;
-  response byte 0's low 2 bits are the RS (return status) field.
-- Register addresses: `ACC_X=0x01`, `ACC_Y=0x02`, `ACC_Z=0x03`,
-  `STATUS=0x06` ("Summary Status"), `MODE=0x0D`, `WHOAMI=0x10`
-  (expected value `0x51`).
-- Software reset = write `0x0020` to the MODE register (bit 5).
-- Mode select = write `0x0000`/`0x0001`/`0x0002`/`0x0003` to MODE register
-  for modes 1/2/3/4 respectively.
-- **Mode 1**: 2700 LSB/g sensitivity, 70Hz first-order LPF (matches the
-  brief's "Default Mode 1 = +/-3g full-scale, 70Hz LPF"). This is the only
-  mode `acquire.py`/`probe_sca3300.py` are designed and tested against.
-- RS = `0b11` means error (all 3 sources agree). RS = `0b01` is the value
-  this repo's own driver expects and observes immediately after a correct
-  startup (see `example_run.md`).
+  response byte 0's low 2 bits are RS (return status).
+- Registers: `ACC_X=0x01`, `ACC_Y=0x02`, `ACC_Z=0x03`, `STATUS=0x06`,
+  `MODE=0x0D`, `WHOAMI=0x10` (expected `0x51`).
+- Software reset = write `0x0020` to MODE; mode select = write
+  `0x0000`-`0x0003` to MODE for modes 1-4.
+- **Mode 1**: 2700 LSB/g, 70Hz first-order LPF (matches the brief's
+  "Default Mode 1 = +/-3g, 70Hz LPF"). Only mode `acquire.py`/
+  `probe_sca3300.py` are designed and tested against.
+- RS `0b11` = error (all sources agree); `0b01` is this repo's own
+  driver's observed post-startup value (`example_run.md`).
 
 ### NOT independently confirmed -- verify before relying on them
 
-- **TEMP register address** (`0x05` in `sca3300.py`): inferred from
-  register-map ordering in community references, not verified against the
-  primary datasheet table in this environment. `read_temp_raw()` returns
-  the validated raw frame only -- no raw-to-Celsius formula is implemented,
-  since that constant could not be confirmed either.
-- **STATUS register bit-level semantics**: `read_status()` reports the raw
-  16-bit value, RS, and a bit array (`bit0`..`bit8`), but individual bit
-  *names/meanings* beyond "any bit set = not clean" are not implemented,
-  since the exact bit table (which bit is X-axis saturation vs. clock
-  error vs. power-on, etc.) could not be confirmed here. `probe_sca3300.py`
-  prints which raw bits are set so a human can cross-reference the actual
-  datasheet's Status Summary register table.
-- **RS values `0b00` and `0b10`**: only `0b11` (error) and `0b01`
-  (post-startup, per this repo's own tested behavior) are used in logic
-  anywhere; the other two are treated as "not an error" but their precise
-  meaning (stale data vs. normal-with-same-value, etc.) isn't asserted.
-- **Modes 2-4 g-range**: sensitivity (LSB/g) and LPF are cross-referenced
-  and consistent across all 3 sources, but the exact +/-g full-scale range
-  for modes 2-4 is not confirmed (only Mode 1's +/-3g is, from the brief
-  itself + cross-reference). Irrelevant unless you change a sensor's
-  `spi.mode` in `config.yaml` away from 1.
+- **TEMP register (`0x05`)**: inferred from register-map ordering, not
+  the primary datasheet. `read_temp_raw()` returns the raw frame only --
+  no raw-to-Celsius formula, since that constant couldn't be confirmed.
+- **STATUS bit-level semantics**: `read_status()` reports raw value, RS,
+  and a bit array, but individual bit *meanings* beyond "any bit set =
+  not clean" aren't implemented -- cross-reference the real datasheet's
+  Status Summary table before relying on them.
+- **RS `0b00`/`0b10`**: only `0b11` (error) and `0b01` (post-startup) are
+  used in logic; the other two are treated as "not an error" but their
+  precise meaning isn't asserted.
+- **Modes 2-4 g-range**: sensitivity/LPF cross-referenced, but g-range
+  isn't (only Mode 1's +/-3g is). Irrelevant unless `spi.mode` != 1.
 - **Exact minimum inter-frame idle time**: the Linux driver applies a 10us
-  SPI delay between requests; `sca3300.py` doesn't add an explicit delay
-  (two separate `spidev.xfer2()` calls already toggle CS, which should
-  satisfy this), but this hasn't been scope-verified against real
-  hardware. If `probe_sca3300.py`'s CRC pass rate is below ~100%, check
-  this first.
-- **Startup settle timings**: the brief's own guidance is "~15ms" after
-  mode select; this repo's own tested driver used 5ms after reset / 20ms
-  after mode select and worked. `sca3300.py` defaults to those tested
-  values (`start_up(post_reset_delay_s=0.005, post_mode_delay_s=0.020)`)
-  but both are parameters -- tighten or loosen them once you have a real
-  board to check settle behavior against.
+  SPI delay; `sca3300.py` doesn't add one explicitly (two separate
+  `xfer2()` calls already toggle CS). If CRC pass rate is below ~100%,
+  check this first.
+- **Startup settle timings**: the brief says "~15ms" after mode select;
+  this repo's tested driver used 5ms/20ms and worked. Both are
+  parameters (`start_up(post_reset_delay_s=..., post_mode_delay_s=...)`)
+  -- tune against real hardware if needed.
 - **J1939 SPN byte layouts** (`j1939.py: KNOWN_SIGNALS`): EEC1 SPN190
-  (Engine Speed, 0.125 rpm/bit, bytes 4-5), SPN513 (Actual Engine %Torque,
-  1%/bit, offset -125%, byte 3), and EEC2 SPN92 (Engine % Load At Current
-  Speed, 1%/bit, byte 3) follow the commonly published SAE J1939-71 byte
-  layout used by most open engine-ECU DBC files. This is **not** a
-  guarantee for any specific vessel's ECU -- it's exactly why
-  `can_discover.py` surfaces candidates instead of hardcoding trust in
-  them, and why `can_map.todo.yaml` requires `confirmed: true` (set by a
-  human after checking a real spin-up/throttle change) before
-  `can_reader.py` will use a signal at all.
+  (Engine Speed), SPN513 (Actual Engine %Torque), EEC2 SPN92 (% Load)
+  follow the commonly published SAE J1939-71 layout, not a guarantee for
+  any specific vessel's ECU -- exactly why `can_discover.py` surfaces
+  candidates instead of trusting them, and `can_map.todo.yaml` requires
+  `confirmed: true` (human-checked against a real spin-up) before
+  `can_reader.py` will use a signal.
 
 ---
 
 ## Task 1 findings
 
-Both `probe_sca3300.py` and `can_discover.py` were built and smoke-tested
-in this environment for logic correctness (CRC/frame construction verified
-byte-for-byte against three independent references; J1939 ID/PGN decode and
-signal extraction verified with synthetic test vectors; `--help`, config
-loading, and graceful-failure paths for missing hardware all exercised).
-**Neither has been run against the actual SCA3300 board or the vessel's CAN
-bus**, since this build environment has no SPI device or CAN adapter
-attached. Run both on the real Pi and keep their `*_result.json` output for
-the record; nothing here should be treated as validated against real
-hardware until that's done.
+`probe_sca3300.py`/`can_discover.py` were smoke-tested for logic
+correctness (CRC/frame construction byte-verified, J1939 decode against
+synthetic vectors, graceful-failure paths exercised) but **neither has
+been run against real hardware** -- this build environment has no SPI
+device or CAN adapter. `tests/hardware/` (see `HARDWARE_TESTING.md`) turns
+that validation into real, gated, runnable tests. Run both tools on the
+real Pi and keep their `*_result.json` for the record before trusting
+anything downstream.
 
-**`tests/hardware/` turns exactly that validation into real, runnable
-tests** (pass/fail assertions against real hardware, not just a report to
-eyeball) -- see `HARDWARE_TESTING.md` for what each one certifies and how
-to run them. They're gated behind an environment variable so the default
-`python3 -m unittest discover -s tests` suite (which this build environment
-*can* run) stays hardware-free and always safe.
-
-What to look for when you do:
-- `probe_sca3300.py`: CRC pass rate should be ~100%; the gravity check
-  should show exactly one axis near +/-1g; the timing report's `p99`
-  interval and `missed_count` are the numbers that decide whether Task 2's
-  2kHz target is achievable in pure Python on this Pi (see fallback below).
-- `can_discover.py`: confirm the adapter `kind` it reports (native
-  SocketCAN vs. slcan) matches what you expect from the adapter's actual
-  chipset, and that at least one EEC1/EEC2 candidate shows up if the bus
-  is J1939. If the bus is proprietary, `can_map.todo.yaml` will come back
-  with no candidates -- fill it in manually from the observed ID table in
-  `can_discover_result.json`.
+What to look for: `probe_sca3300.py`'s CRC pass rate should be ~100%, the
+gravity check should show exactly one axis near +/-1g, and its `p99`/
+`missed_count` decide whether Task 2's 2kHz target is achievable in pure
+Python on this Pi (see fallback below). `can_discover.py`'s adapter `kind`
+should match the adapter's actual chipset, and at least one EEC1/EEC2
+candidate should show up if the bus is J1939 -- if not, the bus is likely
+proprietary; fill `can_map.todo.yaml` in manually from the observed IDs.
 
 ---
 
 ## MCU front-end fallback (not built -- document only)
 
-Per the brief: if `probe_sca3300.py`'s timing characterization shows the Pi
-cannot hold 2kHz within +/-5% jitter (`missed_count` or `p99` outside
-target), **do not force it**. The recommended path is a small
-microcontroller front-end (e.g. RP2040 or STM32) that:
-- Samples the SCA3300 over SPI on a hardware timer at a true 2kHz
-  (independent of any OS scheduling jitter).
-- Buffers evenly-sampled blocks (matching this repo's `block_size`
-  convention) and streams them to the Pi over USB-serial or USB-CDC as
-  fixed-size binary frames, each tagged with an MCU-side monotonic
-  timestamp for the first sample.
-- The Pi-side would then need a thin replacement for `acquire.py`'s
-  sampling loop that reads framed blocks from the MCU's serial port
-  instead of driving SPI directly -- `align.py`, `can_reader.py`, and the
-  block/health data model would be unaffected, since they only depend on
-  receiving `(t0, samples[N,3])` blocks, not on how they were produced.
+If `probe_sca3300.py` shows the Pi can't hold 2kHz within +/-5% jitter,
+**do not force it**. The recommended path is a small microcontroller
+front-end (e.g. RP2040/STM32) that samples the SCA3300 on a hardware
+timer at a true 2kHz, buffers evenly-sampled blocks matching this repo's
+`block_size` convention, and streams them to the Pi over USB-serial,
+each tagged with an MCU-side monotonic timestamp for the first sample.
+The Pi side would need a thin replacement for `acquire.py`'s sampling
+loop reading framed blocks from serial instead of driving SPI --
+`align.py`, `can_reader.py`, and the block/health model are unaffected,
+since they only depend on receiving `(t0, samples[N,3])` blocks.
 
-This is a TODO, not implemented -- `acquire.py` currently always drives the
-SPI bus directly from the Pi's own real-time thread.
+This is a TODO, not implemented -- `acquire.py` always drives SPI
+directly today.
 
 ---
 
 ## Design notes / TODOs
 
 - **SPI read pattern**: `sca3300.py` reads each axis with a
-  request-then-NOP pair (2 SPI transfers per register) rather than a fully
-  rolling pipeline across the whole sample sequence. This matches the
-  already-tested pattern in `src/vibration_monitor.py` and leaves
-  comfortable margin inside the 500us/sample budget at the configured SPI
-  clock. A leaner 1-transfer-per-tick rolling pipeline (deferred-by-one
-  reply) is possible if `probe_sca3300.py`'s timing numbers ever show
-  Python/spidev call overhead -- not raw SPI transfer time -- is the
-  bottleneck; noted here rather than built preemptively.
-- **CAN timestamp alignment** (`can_reader.py`): python-can's SocketCAN
-  backend timestamps frames from the kernel (`SO_TIMESTAMP`,
-  `CLOCK_REALTIME`-based), while the vibration path's timebase is
-  `time.monotonic()`. `CanReader` samples a one-time
-  `monotonic() - time()` offset at the first received frame and applies it
-  to every subsequent message timestamp. This assumes `CLOCK_REALTIME`
-  doesn't step (e.g. an NTP correction) during a run; if that's a concern
-  on your Pi, run `chronyd`/`ntpd` in a mode that slews rather than steps,
-  or re-sample the offset periodically (not implemented here, since it
-  wasn't in scope for Task 2's alignment plumbing).
+  request-then-NOP pair (2 transfers/register) rather than a rolling
+  pipeline -- matches the tested pattern in `src/vibration_monitor.py`
+  and leaves margin inside the 500us/sample budget. A leaner 1-transfer
+  pipeline is possible if timing data ever shows Python/spidev call
+  overhead (not raw transfer time) is the bottleneck.
+- **CAN timestamp alignment**: python-can's SocketCAN timestamps are
+  `CLOCK_REALTIME`-based; `CanReader` samples a one-time
+  `monotonic() - time()` offset at the first frame and applies it after.
+  Assumes `CLOCK_REALTIME` doesn't step during a run (use `chronyd`/
+  `ntpd` slewing if that's a concern).
 - **slcan timestamp quality**: `can_discover.py` reports
-  `kernel_timestamping_expected: false` for slcan adapters, since slcan is
-  a tty line discipline without kernel CAN-frame timestamping;
-  `can_reader.py` will still run against an slcan bus, but expect more
-  jitter in the resulting RPM series than with a native gs_usb adapter.
-- **Block queue**: each sensor gets its own bounded in-memory
-  `queue.Queue` (`sensors[].sampling.queue_maxsize` in config) and drops
-  its oldest block if a consumer falls behind, logging a warning.
-  Optional disk logging (`logging.write_blocks_to_disk`) writes each
-  block as an `.npz` under `logging.raw_dir`, named
-  `<sensor_name>_<t0_ns>.npz`.
+  `kernel_timestamping_expected: false` for slcan (a tty line discipline,
+  no kernel CAN-frame timestamping) -- expect more jitter than gs_usb.
+- **Block queue**: each sensor has its own bounded `queue.Queue`
+  (`sensors[].sampling.queue_maxsize`), drops the oldest block if a
+  consumer falls behind. Optional disk logging writes `.npz` files under
+  `logging.raw_dir`, named `<sensor_name>_<t0_ns>.npz`.
 - **`can_map.yaml` is intentionally not shipped** -- only
-  `can_map.todo.yaml` (a template/example) is. `can_reader.py` raises a
-  clear `CanMapError` if `can_map.yaml` is missing, rather than guessing at
-  signal mappings.
+  `can_map.todo.yaml`. `can_reader.py` raises `CanMapError` if it's
+  missing, rather than guessing signal mappings.

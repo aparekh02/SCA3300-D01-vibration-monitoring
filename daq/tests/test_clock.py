@@ -38,19 +38,14 @@ class TestSharedClock(unittest.TestCase):
 
 
 class TestTicker(unittest.TestCase):
-    """These use a fake, hand-advanceable clock and deliberately never call
-    wait_for_next_tick() from a state where it would need to busy-wait for
-    the clock to advance on its own -- a fake clock that isn't advancing
-    would spin forever in that branch (real time.sleep()/real elapsed time
-    is what normally advances a real clock during the wait). Every call
-    below either pre-advances the fake past the deadline (exercising the
-    "missed" / resync branch, which never spins) or inspects the computed
-    deadline directly without blocking."""
+    """A fake, non-advancing clock would spin forever in the not-missed
+    (busy-wait) branch, so every test below either pre-advances the fake
+    past the deadline (the "missed" branch, which never spins) or inspects
+    the computed deadline directly without blocking."""
 
     def test_two_tickers_on_same_clock_share_a_grid(self):
-        """A 2000Hz and a 1000Hz Ticker built from the same clock should
-        have every 1000Hz deadline coincide exactly with a 2000Hz one --
-        this is what lets two sensors at different rates still produce
+        """Every 1000Hz deadline should coincide exactly with a 2000Hz one
+        on the same clock -- what lets sensors at different rates produce
         directly comparable timestamps."""
         fake = FakeTimeSource(start_ns=0)
         clock = SharedClock(time_source=fake)
@@ -86,11 +81,8 @@ class TestTicker(unittest.TestCase):
         self.assertGreater(next_deadline, fake())
 
     def test_no_missed_flag_when_on_time(self):
-        """The not-missed (sleep + spin) branch inherently needs the clock
-        to advance on its own during the wait, which only a real clock
-        does -- covered here with a real SharedClock and a period short
-        enough to keep the test fast, rather than with FakeTimeSource
-        (which would spin forever waiting for itself to advance)."""
+        """The not-missed (sleep+spin) branch needs the clock to advance on
+        its own, so this uses a real SharedClock instead of the fake."""
         clock = SharedClock()
         ticker = Ticker(clock, period_ns=1_000_000)  # 1kHz, ~1ms away
         _, missed = ticker.wait_for_next_tick()
@@ -122,31 +114,22 @@ class TestHealthMonitor(unittest.TestCase):
         self.assertAlmostEqual(status["invalid_rate"], 2 / 3)
 
     def test_recent_window_stays_bounded_at_capacity(self):
-        """The rolling p99 window is a deque(maxlen=...), not an
-        unbounded list -- pushing well past capacity should never grow
-        its memory footprint, and old values should have been evicted."""
+        """Rolling p99 window is a deque(maxlen=...) -- old values evict."""
         health = HealthMonitor(500_000, recent_cap=100)
         for i in range(1000):
             health.record_interval(500_000 + i)
         self.assertEqual(len(health._recent_intervals_ns), 100)
-        # Only the last 100 pushed values (900..999 added to base) remain.
         self.assertEqual(min(health._recent_intervals_ns), 500_000 + 900)
 
     def test_recording_at_2khz_scale_completes_quickly(self):
-        """Regression guard for the O(n) list.pop(0) bug this replaced:
-        appending well beyond the recent-window cap used to shift the
-        entire list on every call once at capacity, which at a 2kHz
-        sample rate could itself eat into the 500us/sample budget. A
-        deque makes each append O(1) regardless of how many samples have
-        been recorded."""
+        """Regression guard: list.pop(0) here used to be O(n)/call once at
+        capacity, which at 2kHz could itself blow the 500us budget."""
         health = HealthMonitor(500_000)  # default recent_cap=20000
-        n = 60_000  # 3x the cap, i.e. deep into steady-state eviction
+        n = 60_000  # 3x the cap -- deep into steady-state eviction
         start = time.perf_counter()
         for i in range(n):
             health.record_interval(500_000)
         elapsed = time.perf_counter() - start
-        # Generous ceiling (real hardware needs each call under ~500us on
-        # average): this is checking asymptotic behavior, not exact perf.
         self.assertLess(elapsed / n, 100e-6, f"record_interval() averaged {elapsed/n*1e6:.1f}us/call")
 
 
@@ -356,25 +339,12 @@ class TestRealtimeRequired(unittest.TestCase):
 
 
 class TestConcurrentHighRateSensors(unittest.TestCase):
-    """Characterizes the GIL-contention concern directly rather than just
-    asserting it away: two sensors, each busy-wait-spinning at 2kHz on
-    independent Python threads, competing for the GIL on a real (not
-    isolated, not SCHED_FIFO) core.
-
-    Measured on this build's dev sandbox (4 shared vCPUs, no SCHED_FIFO,
-    no isolcpus): a single 2kHz sensor alone already shows ~8% of
-    intervals outside +-5% of 500us (virtualized scheduling jitter, no
-    contention involved at all); two concurrent 2kHz sensors pushes that
-    to roughly 20-40% run to run. That is real evidence, not a guess: pure
-    busy-wait timing in Python does NOT reliably hit a tight jitter target
-    under multi-sensor GIL contention on a non-isolated core -- see
-    CLOCKING.md "GIL and concurrent high-rate sensors" for the numbers and
-    what to do about it (SCHED_FIFO + isolcpus on real hardware, or the
-    documented MCU front-end fallback). The threshold below is a sanity
-    check that the sampler still makes forward progress under contention
-    -- not a stand-in for the real +-5%/~0-missed acceptance bar, which
-    only tests/hardware/test_acquire_soak.py on real hardware can certify.
-    """
+    """Characterizes GIL contention between two 2kHz busy-wait-spinning
+    sensor threads on a real (non-isolated) core, rather than asserting it
+    away -- see CLOCKING.md "GIL and concurrent high-rate sensors" for the
+    measured numbers. The threshold below is a "didn't stall outright"
+    sanity check, not the real +-5%/~0-missed acceptance bar (that's
+    tests/hardware/test_acquire_soak.py, on real hardware)."""
 
     def test_two_2khz_sensors_hold_cadence_under_mutual_load(self):
         hub = SensorHub()
@@ -396,13 +366,8 @@ class TestConcurrentHighRateSensors(unittest.TestCase):
 
         for name, block in (("s1", block_1), ("s2", block_2)):
             health = hub.health(name)
-            # Deliberately generous (measured range on this sandbox was
-            # 20-40%, but a shared/noisy CI host can occasionally push
-            # higher still) -- this is a "didn't stall outright" sanity
-            # check, not a tight regression bound. A tight bound here
-            # would just make this test flaky under variable host load
-            # without catching anything a real hardware run wouldn't
-            # catch better anyway.
+            # Generous on purpose -- see class docstring; a tight bound
+            # here would just be flaky under variable host load.
             self.assertLess(health["missed_pct"], 90.0,
                              f"{name}: missed_pct={health['missed_pct']:.1f}% -- sampler appears to have "
                              f"stalled outright under contention, not just jittered")

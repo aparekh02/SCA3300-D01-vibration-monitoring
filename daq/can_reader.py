@@ -2,19 +2,16 @@
 """
 can_reader.py - background CAN signal reader for Task 2's acquisition path.
 
-Subscribes to the signals defined in can_map.yaml (produced by a human
-confirming candidates from can_discover.py's can_map.todo.yaml output),
-decodes engineering units, and keeps a (monotonic_timestamp, value)
-time-series per signal on the SAME monotonic clock as the vibration path
-(time.monotonic()), so align.py can interpolate one against the other.
+Subscribes to signals in can_map.yaml (human-confirmed from
+can_discover.py's can_map.todo.yaml output), decodes engineering units,
+and keeps a (monotonic_timestamp, value) series per signal on the SAME
+monotonic clock as the vibration path, so align.py can interpolate one
+against the other.
 
 python-can's SocketCAN backend timestamps frames from the kernel
-(SO_TIMESTAMP, CLOCK_REALTIME-based), not Python wall-clock-at-receive.
-Converting that to our monotonic timebase requires one wall<->monotonic
-offset sample at startup; see README for the caveat this introduces if
-CLOCK_REALTIME steps (e.g. an NTP correction) mid-run. slcan adapters
-generally do NOT provide a kernel timestamp at all -- can_discover.py flags
-this per-adapter so the caller knows which timestamp quality to expect.
+(CLOCK_REALTIME-based), not wall-clock-at-receive; converting that to our
+monotonic timebase uses one wall<->monotonic offset sampled at startup --
+see README for the caveat if CLOCK_REALTIME steps (e.g. NTP) mid-run.
 """
 
 from __future__ import annotations

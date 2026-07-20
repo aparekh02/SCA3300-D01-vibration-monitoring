@@ -2,19 +2,12 @@
 """
 sca3300.py - Murata SCA3300-D01 SPI driver.
 
-Frame/CRC/op-code details below were cross-verified (not invented) against:
-  - This repo's own already-tested driver (src/vibration_monitor.py), whose
-    frame constants match live hardware output in example_run.md.
-  - Murata's SCA3300/SCL3300 Linux IIO kernel driver
-    (drivers/iio/accel/sca3300.c) for the register map, CRC8 formula, and
-    per-mode scale/LPF tables.
-  - The algebratech/sca3300-driver Python reference implementation, for the
-    literal 32-bit command frames.
-All three independently agree on: CRC-8 (poly 0x1D, init 0xFF, inverted
-output) over the first 3 bytes of the frame; register addresses for
-ACC_X/Y/Z, STATUS, MODE, WHOAMI; the SW-reset-via-MODE-register pattern; and
-Mode-1 sensitivity/LPF. See README.md "Datasheet assumptions" for exactly
-what is confirmed vs. still needs a hardware/datasheet check.
+Frame/CRC/op-code constants below were cross-verified (not invented)
+against 3 independent sources: this repo's own already-tested driver
+(src/vibration_monitor.py), Murata's Linux IIO kernel driver
+(drivers/iio/accel/sca3300.c), and the algebratech/sca3300-driver Python
+reference. See README.md "Datasheet assumptions" for what's confirmed vs.
+still needs a hardware/datasheet check.
 """
 
 from __future__ import annotations
@@ -22,7 +15,6 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 import spidev
 
@@ -154,17 +146,11 @@ class SCA3300StartupError(SCA3300Error):
 
 
 class SCA3300:
-    """Encapsulates startup, mode select, and validated register reads.
-
-    Every reply frame's CRC and RS are checked; callers get an exception
-    instead of a silently-wrong sample. Uses the simple "send command, then
-    send NOP and read its reply" pattern (2 SPI transfers per register)
-    rather than a fully rolling pipeline -- this matches the already-tested
-    driver in src/vibration_monitor.py and comfortably fits the 500us/sample
-    budget at typical SPI clock rates; see README for the timing margin and
-    a note on a leaner pipelined variant if probe_sca3300.py timing data
-    ever shows it's needed.
-    """
+    """Startup, mode select, and validated register reads -- every reply's
+    CRC/RS is checked, callers get an exception instead of a silently-wrong
+    sample. Reads use "send command, then NOP" (2 transfers/register,
+    matching src/vibration_monitor.py) rather than a rolling pipeline; see
+    README for the timing margin and a leaner-pipeline alternative."""
 
     def __init__(self, bus: int = 0, device: int = 0, max_speed_hz: int = 2_000_000, mode: int = 1):
         if mode not in MODE_SELECT_DATA:
@@ -200,14 +186,10 @@ class SCA3300:
                  post_mode_delay_s: float = 0.020) -> StatusFlags:
         """Datasheet startup sequence: SW reset, select mode, wait, read
         STATUS repeatedly to clear power-on flags, then confirm STATUS is
-        clean and WHOAMI matches.
-
-        Delay defaults follow the values already exercised against real
-        hardware in src/vibration_monitor.py (5ms / 20ms); the brief's own
-        guidance is "~15ms" after mode select -- both are provided/
-        configurable since the exact settle time is a datasheet value this
-        build environment could not directly confirm from the primary PDF.
-        """
+        clean and WHOAMI matches. Delay defaults (5ms/20ms) match values
+        already exercised against real hardware in src/vibration_monitor.py
+        (the brief's own guidance is "~15ms" after mode select); both are
+        configurable since the exact settle time isn't datasheet-confirmed."""
         self._xfer(build_frame(REG_MODE, write=True, data=MODE_SW_RESET_DATA))
         time.sleep(post_reset_delay_s)
 

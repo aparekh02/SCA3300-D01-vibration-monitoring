@@ -2,15 +2,12 @@
 """
 acquire.py - Task 2 entry point: deterministic vibration acquisition.
 
-Registers every sensor listed in config.yaml's `sensors:` list on a
-clock.SensorHub, which drives each at its configured fixed rate on its own
-dedicated real-time thread (monotonic-timer driven, not sensor-interrupt or
-FIFO driven -- the -D01 breakout has neither), assembling fixed-length
-evenly-sampled blocks and tracking health (jitter/missed-samples/CRC error
-rate) per sensor. Adding a second sensor is a config.yaml edit, not a code
-change -- see CLOCKING.md for the design and config.yaml's `sensors:` list
-for the schema; only `type: sca3300` is implemented today since that's the
-only sensor this build has hardware for.
+Registers every sensor in config.yaml's `sensors:` list on a
+clock.SensorHub, each on its own real-time thread (monotonic-timer
+driven, not interrupt/FIFO -- the -D01 breakout has neither), assembling
+evenly-sampled blocks and tracking health per sensor. Adding a sensor is a
+config edit, not a code change -- see CLOCKING.md; only `type: sca3300` is
+implemented since that's the only sensor this build has hardware for.
 
 No FFT/diagnostics here -- only acquisition + alignment plumbing, per brief.
 """
@@ -74,15 +71,8 @@ def _safe_reinit(sca: SCA3300):
 
 class Acquirer:
     """Registers every `sensors:` entry from config.yaml onto a
-    clock.SensorHub. Kept as a small class (rather than inlining everything
-    in main()) so probe-style tools/tests can drive it directly without
-    going through argparse/CLI.
-
-    For the common single-sensor case, get_block()/health_status() work
-    without naming the sensor (there's only one to mean); with more than
-    one registered, callers must say which sensor they want a block from,
-    though health_status() still has a sensible aggregate default.
-    """
+    clock.SensorHub. With exactly one sensor, get_block()/health_status()
+    work without naming it; with more than one, callers must say which."""
 
     def __init__(self, cfg: dict, hub: Optional[SensorHub] = None):
         self._cfg = cfg

@@ -17,9 +17,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from _hw_common import require_hardware_tests, load_config, DAQ_DIR
+from _hw_common import require_hardware_tests, load_config
 
-from sca3300 import SCA3300, SCA3300Error
+from sca3300 import SCA3300
 from probe_sca3300 import gravity_check, crc_burst_check, timing_characterization, find_sensor_config
 
 

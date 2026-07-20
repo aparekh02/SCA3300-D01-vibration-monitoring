@@ -1,24 +1,17 @@
-# daq/can_map.todo.yaml
+# TEMPLATE. `can_discover.py` regenerates this populated with arbitration
+# IDs actually observed on the bus -- run it on the real wiring and use ITS
+# output, not this static example, as your starting point.
 #
-# This is a TEMPLATE. `can_discover.py` regenerates a version of this file
-# populated with the arbitration IDs it actually observed on the bus (rates,
-# sample payloads, J1939 PGN/SPN decode where applicable) -- run it on the
-# real vessel wiring and use ITS output, not this static example, as your
-# starting point.
-#
-# Nothing in this file is consumed directly by acquire.py / can_reader.py.
-# A human must review the candidates, confirm each one against a real
-# spin-up / throttle change on the actual engine, and copy the confirmed
-# entries into can_map.yaml (see config.yaml: can.map_file) using the same
-# schema. Do not promote an entry to can_map.yaml with confirmed: false.
+# Nothing here is consumed directly by acquire.py/can_reader.py. Confirm
+# each candidate against a real spin-up/throttle change, then copy
+# confirmed entries into can_map.yaml (config.yaml: can.map_file) -- never
+# promote an entry with confirmed: false.
 
 schema_version: 1
 
-# Candidates below are the PGN/SPN combinations the brief calls out as the
-# prime targets, using the standard published SAE J1939-71 byte layout
-# (see daq/j1939.py KNOWN_SIGNALS). They are starting points, not guesses
-# about *this* vessel's actual bus -- confirm arbitration ID, source
-# address, and units against real can_discover.py output.
+# Candidates below use the standard published SAE J1939-71 byte layout
+# (see j1939.py KNOWN_SIGNALS) -- starting points, not guesses about this
+# vessel's actual bus.
 
 signals:
   rpm:

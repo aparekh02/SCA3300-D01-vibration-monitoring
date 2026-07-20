@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-clock.py - shared monotonic clock + generic fixed-rate sampler, so more than
-one sensor can be acquired at once without each one inventing its own timing
-loop or drifting onto its own private time axis.
+clock.py - shared monotonic clock + generic fixed-rate sampler, so more
+than one sensor can be acquired at once without each inventing its own
+timing loop or timebase.
 
-Three pieces, in order of composition:
-
-  SharedClock   - the one time source every sensor timestamps against.
-  Ticker        - fixed-rate deadline scheduling anchored to a SharedClock's
-                  origin, so two Tickers at different rates still land on a
-                  common grid instead of drifting apart from whenever each
-                  thread happened to start.
-  RealTimeSampler - a generic "read a sample, assemble a block, track
-                  health" loop that knows nothing about SPI/CAN/any
-                  particular sensor; sensor-specific behavior is entirely
-                  in the `read_fn` callable passed to it.
-  SensorHub     - the registration point for running several
-                  RealTimeSamplers concurrently (each its own thread, own
-                  optional CPU core, own fault domain) while all sharing
-                  one SharedClock.
+SharedClock (shared time source) -> Ticker (fixed-rate deadlines on it)
+-> RealTimeSampler (read/assemble/health loop, sensor-agnostic) ->
+SensorHub (registers several RealTimeSamplers on one SharedClock).
 
 See CLOCKING.md for the design rationale and a worked multi-sensor example.
 """
@@ -40,17 +28,9 @@ logger = logging.getLogger(__name__)
 
 
 class SharedClock:
-    """The single monotonic time source sensors timestamp against.
-
-    Wrapping time.monotonic_ns() here (rather than every sampler calling it
-    directly) buys three things: (1) one definition of "t=0" -- the moment
-    this clock was created -- so two samplers started at different wall-
-    clock moments still land on the same axis without a manual per-sensor
-    offset; (2) tests can inject a fake, hand-advanceable time source to
-    drive deterministic timing scenarios without real sleeping; (3) if this
-    ever needs to become a hardware/PTP clock instead of monotonic_ns, only
-    this class changes -- Ticker/RealTimeSampler/SensorHub do not.
-    """
+    """The single monotonic time source sensors timestamp against -- one
+    shared "t=0" so independently-started samplers land on the same axis,
+    and tests can inject a fake time source for deterministic timing."""
 
     def __init__(self, time_source: Callable[[], int] = time.monotonic_ns):
         self._time_source = time_source
@@ -68,14 +48,9 @@ class SharedClock:
 
 
 class Ticker:
-    """Fixed-rate deadline scheduler anchored to a SharedClock's origin.
-
-    Anchoring to the clock's origin (rather than "now" at Ticker
-    construction) means a 2000Hz Ticker and a 1000Hz Ticker built from the
-    same SharedClock always have every 1000Hz deadline land exactly on a
-    2000Hz deadline too -- useful when two sensors at different rates need
-    samples that line up on a shared grid, not just "close in time".
-    """
+    """Fixed-rate deadline scheduler anchored to a SharedClock's origin
+    (not "now" at construction), so Tickers at different rates on the same
+    clock land on a shared grid instead of drifting apart."""
 
     def __init__(self, clock: SharedClock, period_ns: int):
         self._clock = clock
@@ -88,14 +63,9 @@ class Ticker:
         return self._clock.origin_ns + (ticks_elapsed + 1) * self.period_ns
 
     def wait_for_next_tick(self, spin_margin_ns: int = 100_000) -> tuple:
-        """Blocks (sleep + short busy-wait spin) until the next deadline.
-
-        Returns (deadline_ns, missed) where `missed` is True if the
-        deadline had already passed when this was called (the caller was
-        running behind). On a miss, the schedule re-syncs to the next grid
-        point from "now" rather than trying to catch up a queue of missed
-        ticks, which would just cascade the lateness forward.
-        """
+        """Sleeps + spins until the next deadline. Returns (deadline_ns,
+        missed); on a miss, re-syncs to the next grid point from "now"
+        instead of queuing up the backlog."""
         remaining_ns = self._next_deadline_ns - self._clock.now_ns()
         missed = remaining_ns <= 0
 
@@ -131,10 +101,8 @@ class HealthMonitor:
         self._missed = 0
         self._invalid = 0
         self._samples_total = 0
-        # deque(maxlen=...) evicts the oldest element in O(1); a plain list
-        # with list.pop(0) here would be O(n) per sample once at capacity --
-        # on a 2kHz path that shift cost alone could threaten the very
-        # 500us budget this monitor exists to measure.
+        # deque(maxlen) evicts in O(1); list.pop(0) here was O(n)/sample at
+        # capacity -- on a 2kHz path that alone could blow the 500us budget.
         self._recent_intervals_ns: deque = deque(maxlen=recent_cap)
         self._lock = threading.Lock()
 
@@ -188,13 +156,9 @@ class Block:
 
 
 def set_realtime(priority: int, cpu_core: Optional[int]) -> tuple:
-    """Best-effort SCHED_FIFO + CPU pin for the calling thread. Requires
-    root or CAP_SYS_NICE. Returns (sched_fifo_active, cpu_pinned) rather
-    than just logging, so a caller (or a health dashboard) can tell
-    *without hardware timing degrading first* whether it's actually
-    running with real-time guarantees or silently fell back to normal
-    scheduling -- see RealTimeSampler's `realtime_required` for turning
-    that fallback into a hard failure instead of a easy-to-miss warning."""
+    """Best-effort SCHED_FIFO + CPU pin for the calling thread (root or
+    CAP_SYS_NICE required). Returns (sched_fifo_active, cpu_pinned) so
+    callers can tell it fell back instead of only logging it."""
     sched_fifo_active = False
     try:
         os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(priority))
@@ -218,13 +182,10 @@ def set_realtime(priority: int, cpu_core: Optional[int]) -> tuple:
 
 
 class RealTimeSampler:
-    """Generic fixed-rate sampler: reads `read_fn()` -> (values, valid) at
-    `rate_hz`, driven by a Ticker on a shared clock, assembles fixed-size
-    blocks, and tracks health. Knows nothing about SPI, CAN, or any
-    specific sensor -- that is entirely `read_fn`'s job -- which is what
-    lets several different sensors share one clocking mechanism while
-    running as independent threads with independent fault domains.
-    """
+    """Generic fixed-rate sampler: reads `read_fn()` -> (values, valid),
+    assembles blocks, tracks health. Knows nothing about SPI/CAN/any
+    specific sensor -- that's entirely read_fn's job -- which is what lets
+    several sensors share one clocking mechanism as independent threads."""
 
     def __init__(self, name: str, read_fn: Callable[[], tuple], n_channels: int, rate_hz: float,
                  block_size: int, clock: SharedClock, queue_maxsize: int = 8,
@@ -249,10 +210,8 @@ class RealTimeSampler:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
-        # Real-time status is set from inside the sampler thread (Linux
-        # scheduling policy/affinity are per-thread, so they can only be
-        # applied there), then surfaced here so it's visible in
-        # health_status() instead of only as an easy-to-miss log line.
+        # Set from inside the sampler thread (sched policy/affinity are
+        # per-thread) and surfaced in health_status(), not just logged.
         self.sched_fifo_active = False
         self.cpu_pinned = False
         self._startup_error: Optional[Exception] = None
@@ -360,16 +319,10 @@ class RealTimeSampler:
 
 
 class SensorHub:
-    """Registration point for running multiple sensors at once.
-
-    Each call to add_sensor() gets its own RealTimeSampler / thread /
-    (optional) CPU core / independent fault domain -- one sensor's read
-    errors or a full queue never touch another's. All samplers share this
-    hub's single SharedClock, so every sensor's block timestamps sit on
-    the same monotonic axis and are directly comparable (feed two sensors'
-    blocks straight into align.py) without any extra synchronization step.
-    See CLOCKING.md for a full worked example with two concurrent sensors.
-    """
+    """Registration point for running multiple sensors at once. Each
+    add_sensor() gets its own thread/queue/fault domain, but all share
+    this hub's SharedClock so block timestamps stay directly comparable
+    across sensors. See CLOCKING.md for a worked multi-sensor example."""
 
     def __init__(self, clock: Optional[SharedClock] = None):
         self.clock = clock or SharedClock()
@@ -393,10 +346,8 @@ class SensorHub:
                 sampler.start()
                 started.append(sampler)
         except Exception:
-            # Don't leave earlier sensors running if a later one fails to
-            # start (e.g. realtime_required and SCHED_FIFO was denied) --
-            # one sensor's startup failure shouldn't leave others as an
-            # orphaned, unmanaged background thread.
+            # Don't leave earlier sensors running as orphaned threads if a
+            # later one fails to start.
             for sampler in started:
                 sampler.stop()
             raise
