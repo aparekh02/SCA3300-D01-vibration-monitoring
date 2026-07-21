@@ -28,6 +28,10 @@ import numpy as np
 from collections import deque
 from pathlib import Path
 
+from config import DualBandConfig, TrendConfig
+from processing.dual_band import DualBandProcessor
+from processing.trend import ExtendedBandTrendTracker
+
 # ==================================================================
 # SPI / Sensor setup (SCA3300-D01, per Murata datasheet Doc.No 3165)
 # ==================================================================
@@ -106,14 +110,31 @@ def read_xyz():
 # Configuration
 # ==================================================================
 
-SAMPLE_RATE_HZ   = 100          # target sampling rate (Hz)
-WINDOW_SIZE      = 256          # samples per FFT window (power of 2 recommended)
+# Raised 100 -> 200 Hz so Nyquist (100 Hz) clears the dual-band extended
+# band (70-82 Hz) and gives the existing FFT/peak-finder visibility past
+# 70 Hz too. Not raised further because read_axis() has a hardcoded
+# ~3ms settle-sleep floor per x/y/z sample. Does not clear the 95-180 Hz
+# noise-gate band. CONFIRM on real hardware via
+# src/dual_band_hardware_check.py -- see NOTES.md Section 3.
+SAMPLE_RATE_HZ   = 200          # target sampling rate (Hz)
+WINDOW_SIZE      = 512          # samples per FFT window; scaled with
+                                 # SAMPLE_RATE_HZ to keep ~2.56s/window
 
 BASE_DIR         = Path(__file__).resolve().parent.parent
 RAW_LOG_FILE     = BASE_DIR / "data" / "raw" / "raw_vibration_log.csv"
 METRICS_LOG_FILE = BASE_DIR / "data" / "metrics" / "vibration_metrics.csv"
 
 SAMPLE_PERIOD = 1.0 / SAMPLE_RATE_HZ
+
+# ==================================================================
+# Dual-band vibration processor (additive -- see processing/, NOTES.md)
+# ==================================================================
+
+DUAL_BAND_TRUSTED_LOG_FILE   = BASE_DIR / "data" / "metrics" / "dual_band_trusted.csv"
+EXTENDED_BAND_TREND_LOG_FILE = BASE_DIR / "data" / "metrics" / "extended_band_trend.csv"
+
+DUAL_BAND_CONFIG = DualBandConfig(fs=float(SAMPLE_RATE_HZ))
+TREND_CONFIG = TrendConfig()
 
 # ==================================================================
 # Calibration (baseline removal / deadband)
@@ -189,12 +210,28 @@ METRICS_HEADER = [
     "health_score", "health_status", "spike_in_window",
 ]
 
+# Own files rather than new METRICS_HEADER columns, so that schema is
+# unchanged; extended_band_trend.csv is the flagged UNCALIBRATED channel.
+DUAL_BAND_TRUSTED_HEADER = [
+    "window_end_time", "axis",
+    "broadband_rms_g", "rms_0_10hz_g", "rms_10_30hz_g", "rms_30_70hz_g",
+    "validated",
+]
+
+EXTENDED_BAND_TREND_HEADER = [
+    "window_end_time", "axis", "rpm",
+    "level", "reliable", "snr", "uncalibrated",
+    "rising", "baseline",
+]
+
 def init_csv_files():
     RAW_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     METRICS_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     raw_new = not RAW_LOG_FILE.exists()
     metrics_new = not METRICS_LOG_FILE.exists()
+    dual_band_new = not DUAL_BAND_TRUSTED_LOG_FILE.exists()
+    extended_trend_new = not EXTENDED_BAND_TREND_LOG_FILE.exists()
 
     raw_f = open(RAW_LOG_FILE, "a", newline="")
     raw_writer = csv.writer(raw_f)
@@ -206,7 +243,20 @@ def init_csv_files():
     if metrics_new:
         metrics_writer.writerow(METRICS_HEADER)
 
-    return raw_f, raw_writer, metrics_f, metrics_writer
+    dual_band_f = open(DUAL_BAND_TRUSTED_LOG_FILE, "a", newline="")
+    dual_band_writer = csv.writer(dual_band_f)
+    if dual_band_new:
+        dual_band_writer.writerow(DUAL_BAND_TRUSTED_HEADER)
+
+    extended_trend_f = open(EXTENDED_BAND_TREND_LOG_FILE, "a", newline="")
+    extended_trend_writer = csv.writer(extended_trend_f)
+    if extended_trend_new:
+        extended_trend_writer.writerow(EXTENDED_BAND_TREND_HEADER)
+
+    return (
+        raw_f, raw_writer, metrics_f, metrics_writer,
+        dual_band_f, dual_band_writer, extended_trend_f, extended_trend_writer,
+    )
 
 # ==================================================================
 # FFT / spectral analysis
@@ -338,6 +388,25 @@ def metrics_row(window_end_time, axis, metrics, health_score, health_status, spi
     row += [f"{health_score:.1f}", health_status, int(spike_in_window)]
     return row
 
+def dual_band_trusted_row(window_end_time, axis, trusted):
+    sub = trusted.sub_band_rms
+    return [
+        f"{window_end_time:.6f}", axis,
+        f"{trusted.broadband_rms:.5f}",
+        f"{sub.get('0_10hz', 0.0):.5f}",
+        f"{sub.get('10_30hz', 0.0):.5f}",
+        f"{sub.get('30_70hz', 0.0):.5f}",
+        int(trusted.validated),
+    ]
+
+def extended_band_trend_row(window_end_time, axis, rpm, extended, rising, baseline):
+    return [
+        f"{window_end_time:.6f}", axis,
+        f"{rpm:.1f}" if rpm is not None else "",
+        f"{extended.level:.5f}", int(extended.reliable), f"{extended.snr:.3f}",
+        int(extended.uncalibrated), int(rising), f"{baseline:.5f}",
+    ]
+
 # ==================================================================
 # Health scoring model
 #
@@ -437,8 +506,17 @@ def main():
     startup()
     calibrate_baseline()
 
-    raw_f, raw_writer, metrics_f, metrics_writer = init_csv_files()
+    (
+        raw_f, raw_writer, metrics_f, metrics_writer,
+        dual_band_f, dual_band_writer, extended_trend_f, extended_trend_writer,
+    ) = init_csv_files()
     health = HealthMonitor(SAMPLE_RATE_HZ)
+    dual_band_processor = DualBandProcessor(DUAL_BAND_CONFIG)
+    trend_tracker = ExtendedBandTrendTracker(TREND_CONFIG)
+
+    # TODO(RPM-SOURCE): no CAN/tachometer input exists in this repo (see
+    # NOTES.md), so rpm stays None and the trend update below is skipped.
+    rpm = None
 
     x_buf = deque(maxlen=WINDOW_SIZE)
     y_buf = deque(maxlen=WINDOW_SIZE)
@@ -450,6 +528,8 @@ def main():
           f"(~{WINDOW_SIZE / SAMPLE_RATE_HZ:.1f}s per window)")
     print(f"Raw log     -> {RAW_LOG_FILE}")
     print(f"Metrics log -> {METRICS_LOG_FILE}")
+    print(f"Dual-band trusted log -> {DUAL_BAND_TRUSTED_LOG_FILE}")
+    print(f"Extended-band trend log (UNCALIBRATED, trend-only) -> {EXTENDED_BAND_TREND_LOG_FILE}")
     print("Press Ctrl+C to stop.\n")
 
     sample_count = 0
@@ -500,6 +580,28 @@ def main():
                 )
                 metrics_f.flush()
 
+                # ---- Dual-band processor (additive) ----
+                # Extended is routed ONLY to the trend tracker / its own
+                # CSV -- never into score/status/metrics_writer above, so
+                # it cannot reach health scoring or alarm/fault logic.
+                for axis_name, buf in (("x", x_buf), ("y", y_buf), ("z", z_buf)):
+                    db_result = dual_band_processor.process(np.array(buf))
+                    dual_band_writer.writerow(
+                        dual_band_trusted_row(now, axis_name, db_result.trusted)
+                    )
+
+                    if rpm is not None:
+                        rising, baseline = trend_tracker.update(rpm, db_result.extended)
+                    else:
+                        rising, baseline = False, 0.0
+                    extended_trend_writer.writerow(
+                        extended_band_trend_row(
+                            now, axis_name, rpm, db_result.extended, rising, baseline
+                        )
+                    )
+                dual_band_f.flush()
+                extended_trend_f.flush()
+
                 sources = ", ".join(f"{f:.1f}Hz" for f, _ in combined["peaks"]) or "none"
                 print(f"[{now:.1f}] window processed | combined RMS={combined['rms']:.3f}g "
                       f"sources=[{sources}] | health={score:.1f} ({status})")
@@ -520,6 +622,8 @@ def main():
     finally:
         raw_f.close()
         metrics_f.close()
+        dual_band_f.close()
+        extended_trend_f.close()
 
 if __name__ == "__main__":
     main()
