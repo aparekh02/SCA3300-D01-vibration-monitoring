@@ -1,28 +1,12 @@
 #!/usr/bin/env python3
-"""
-dual_band_hardware_check.py
+"""Run ON THE PI with the SCA3300 connected (imports vibration_monitor.py,
+which opens the real SPI bus at import time) to check what this repo can't
+verify without hardware: whether read_axis()/read_xyz() actually sustain
+SAMPLE_RATE_HZ, and whether a live block shows content above 70 Hz through
+both the existing general FFT and the dual-band processor. See NOTES.md
+Section 3.
 
-Run this ON THE RASPBERRY PI with the SCA3300 connected, whenever
-SAMPLE_RATE_HZ changes, to check the two things this repo cannot verify
-without real hardware (see NOTES.md Section 3):
-
-  1. Timing -- can read_axis()/read_xyz() actually sustain
-     vibration_monitor.SAMPLE_RATE_HZ, or does it fall behind (which
-     would silently widen the FFT's real bin spacing / skew window
-     timing vs. what the code assumes)?
-  2. Content -- does a live block actually carry energy above 70 Hz once
-     fs is high enough, and do the existing general FFT/peak-finder and
-     the dual-band processor agree it's there -- while staying two
-     separate computations over the same live block (no shared state,
-     confirming the isolation guarantee holds on real data too, not just
-     synthetic test signals)?
-
-This imports vibration_monitor.py, which opens the real SPI bus at
-import time -- only run this on the Pi with the sensor wired up, the
-same as running vibration_monitor.py itself.
-
-Usage:
-    python3 src/dual_band_hardware_check.py [--seconds 5]
+Usage: python3 src/dual_band_hardware_check.py [--seconds 5]
 """
 
 import argparse

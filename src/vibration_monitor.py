@@ -110,27 +110,15 @@ def read_xyz():
 # Configuration
 # ==================================================================
 
-# CONFIRM on real hardware (run src/dual_band_hardware_check.py) before
-# trusting this in continuous operation -- see NOTES.md Section 3.
-#
-# Raised from 100 -> 200 Hz so Nyquist (100 Hz) clears the dual-band
-# extended band (70-82 Hz) with margin, which also gives the EXISTING
-# general FFT/peak-finder (compute_fft/find_top_peaks below -- unchanged,
-# it has no upper cutoff of its own) visibility into that range for the
-# first time; at 100 Hz neither could see past 50 Hz. 200 Hz was chosen,
-# not something higher, because read_axis() has three hardcoded 1 ms
-# settle sleeps per x/y/z sample (3 ms floor before SPI transfer time is
-# even counted) -- a ~200 Hz sample period (5 ms) leaves some margin
-# above that floor, where e.g. 500 Hz (2 ms period) would not. It does
-# NOT clear the extended path's 95-180 Hz noise-gate band (that would
-# need fs well above 360 Hz, out of reach of this loop's timing budget
-# without redesigning read_axis() -- out of scope here); the noise
-# estimate is correspondingly weaker (only ~95-100 Hz worth of bins) --
-# see NOTES.md.
+# Raised 100 -> 200 Hz so Nyquist (100 Hz) clears the dual-band extended
+# band (70-82 Hz) and gives the existing FFT/peak-finder visibility past
+# 70 Hz too. Not raised further because read_axis() has a hardcoded
+# ~3ms settle-sleep floor per x/y/z sample. Does not clear the 95-180 Hz
+# noise-gate band. CONFIRM on real hardware via
+# src/dual_band_hardware_check.py -- see NOTES.md Section 3.
 SAMPLE_RATE_HZ   = 200          # target sampling rate (Hz)
-WINDOW_SIZE      = 512          # samples per FFT window (power of 2 recommended)
-                                 # -- scaled with SAMPLE_RATE_HZ to keep the
-                                 # same ~2.56s window duration/bin width as before
+WINDOW_SIZE      = 512          # samples per FFT window; scaled with
+                                 # SAMPLE_RATE_HZ to keep ~2.56s/window
 
 BASE_DIR         = Path(__file__).resolve().parent.parent
 RAW_LOG_FILE     = BASE_DIR / "data" / "raw" / "raw_vibration_log.csv"
@@ -139,16 +127,12 @@ METRICS_LOG_FILE = BASE_DIR / "data" / "metrics" / "vibration_metrics.csv"
 SAMPLE_PERIOD = 1.0 / SAMPLE_RATE_HZ
 
 # ==================================================================
-# Dual-band vibration processor (additive -- see processing/dual_band.py,
-# processing/trend.py, and NOTES.md/README.md for the two-path design and
-# isolation guarantee)
+# Dual-band vibration processor (additive -- see processing/, NOTES.md)
 # ==================================================================
 
 DUAL_BAND_TRUSTED_LOG_FILE   = BASE_DIR / "data" / "metrics" / "dual_band_trusted.csv"
 EXTENDED_BAND_TREND_LOG_FILE = BASE_DIR / "data" / "metrics" / "extended_band_trend.csv"
 
-# fs is pinned to the loop's actual SAMPLE_RATE_HZ (not DualBandConfig's
-# 2000.0 default) so this reflects what the live loop really captures.
 DUAL_BAND_CONFIG = DualBandConfig(fs=float(SAMPLE_RATE_HZ))
 TREND_CONFIG = TrendConfig()
 
@@ -226,10 +210,8 @@ METRICS_HEADER = [
     "health_score", "health_status", "spike_in_window",
 ]
 
-# Dual-band outputs are logged to their own files rather than added as
-# columns to METRICS_HEADER, so that CSV schema stays exactly as it was.
-# extended_band_trend.csv is the "clearly separate, flagged channel" the
-# extended (UNCALIBRATED) path is routed to -- see README.md.
+# Own files rather than new METRICS_HEADER columns, so that schema is
+# unchanged; extended_band_trend.csv is the flagged UNCALIBRATED channel.
 DUAL_BAND_TRUSTED_HEADER = [
     "window_end_time", "axis",
     "broadband_rms_g", "rms_0_10hz_g", "rms_10_30hz_g", "rms_30_70hz_g",
@@ -532,13 +514,8 @@ def main():
     dual_band_processor = DualBandProcessor(DUAL_BAND_CONFIG)
     trend_tracker = ExtendedBandTrendTracker(TREND_CONFIG)
 
-    # TODO(RPM-SOURCE): this repo has no CAN/tachometer input, so there is
-    # no concurrent RPM value to pair with a block (see NOTES.md). The
-    # trend tracker buckets by RPM (processing/trend.py), so until a real
-    # source is wired in here, rpm stays None and the extended-band trend
-    # update below is skipped -- extended_band_trend.csv still records
-    # each block's UNCALIBRATED level/reliable/snr, just without a
-    # baseline/rising judgement.
+    # TODO(RPM-SOURCE): no CAN/tachometer input exists in this repo (see
+    # NOTES.md), so rpm stays None and the trend update below is skipped.
     rpm = None
 
     x_buf = deque(maxlen=WINDOW_SIZE)
@@ -603,14 +580,10 @@ def main():
                 )
                 metrics_f.flush()
 
-                # ---- Dual-band vibration processor (additive) ----
-                # Trusted: no correction, written to its own validated CSV
-                # channel alongside the existing per-axis metrics above.
-                # Extended: permanently UNCALIBRATED, routed ONLY to the
-                # trend tracker / extended_band_trend.csv -- never into
-                # `score`/`status` or metrics_writer above, so it cannot
-                # reach the existing health scoring or any alarm/fault
-                # logic. See README.md "Extended band usage rule".
+                # ---- Dual-band processor (additive) ----
+                # Extended is routed ONLY to the trend tracker / its own
+                # CSV -- never into score/status/metrics_writer above, so
+                # it cannot reach health scoring or alarm/fault logic.
                 for axis_name, buf in (("x", x_buf), ("y", y_buf), ("z", z_buf)):
                     db_result = dual_band_processor.process(np.array(buf))
                     dual_band_writer.writerow(

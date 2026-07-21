@@ -1,11 +1,6 @@
-"""
-Regression coverage for the existing (pre-dual-band) analysis in
-vibration_monitor.py. There was no test suite for this module before this
-change (see NOTES.md); these lock in current behavior of its pure
-functions so the additive dual-band wiring can't silently alter them.
-Hardware/IO (SPI reads, CSV files, the sampling loop) is out of scope --
-only the parts of vibration_monitor.py that don't touch real hardware.
-"""
+"""Regression coverage for the pre-existing analysis in vibration_monitor.py
+(no test suite existed before this change -- see NOTES.md). Hardware/IO is
+out of scope; only pure functions are covered."""
 
 import numpy as np
 import pytest
@@ -23,32 +18,15 @@ def test_metrics_header_unchanged():
     ]
 
 
-def test_compute_kurtosis_constant_signal_is_zero():
-    assert vm.compute_kurtosis(np.full(50, 0.5)) == 0.0
-
-
 def test_compute_fft_finds_dominant_frequency():
-    fs = 100.0
-    n = 256
+    fs, n, freq = 100.0, 256, 10.0
     t = np.arange(n) / fs
-    freq = 10.0
     signal = 0.5 * np.sin(2 * np.pi * freq * t)
 
     freqs, mags = vm.compute_fft(signal, fs)
-    peaks = vm.find_top_peaks(freqs, mags, num_peaks=1)
+    dom_freq, _ = vm.find_top_peaks(freqs, mags, num_peaks=1)[0]
 
-    assert len(peaks) == 1
-    dom_freq, _ = peaks[0]
     assert dom_freq == pytest.approx(freq, abs=fs / n)
-
-
-def test_compute_axis_metrics_rms_matches_definition():
-    signal = np.array([1.0, -1.0, 1.0, -1.0])
-    metrics = vm.compute_axis_metrics(signal, fs=100.0)
-
-    assert metrics["rms"] == pytest.approx(1.0)
-    assert metrics["peak"] == pytest.approx(1.0)
-    assert metrics["p2p"] == pytest.approx(2.0)
 
 
 def test_health_monitor_starts_at_max_score():

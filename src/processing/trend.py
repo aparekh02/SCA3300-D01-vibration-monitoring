@@ -1,12 +1,6 @@
-"""
-trend.py
-
-RPM-bucketed EMA baseline tracker for the extended band's `level`. This is
-the ONLY consumer of ExtendedBandResult that vibration_monitor.py's
-wiring feeds -- extended-band output must never reach an alarm threshold
-or the order-tracking fault logic (it is permanently `uncalibrated`, a
-relative trend signal only). See README.md "Extended band usage rule".
-"""
+"""RPM-bucketed EMA baseline tracker for the extended band's `level`.
+The only consumer of ExtendedBandResult -- never an alarm threshold or
+fault logic, see README "Extended band usage rule"."""
 
 from __future__ import annotations
 
@@ -24,9 +18,7 @@ class _BucketState:
 
 
 class ExtendedBandTrendTracker:
-    """Stateful across calls (unlike DualBandProcessor): holds one EMA
-    baseline + sample count per RPM bucket, keyed by rpm rounded to the
-    nearest rpm_bucket_width."""
+    """Holds one EMA baseline + sample count per RPM bucket."""
 
     def __init__(self, config: TrendConfig = DEFAULT_TREND_CONFIG):
         self.config = config
@@ -36,12 +28,8 @@ class ExtendedBandTrendTracker:
         return int(round(rpm / self.config.rpm_bucket_width))
 
     def update(self, rpm: float, extended: ExtendedBandResult) -> Tuple[bool, float]:
-        """Returns (rising, baseline) for this sample's bucket.
-
-        Unreliable samples are ignored entirely: no baseline change, and
-        `rising` is reported False rather than raising a flag off of data
-        the extended path itself doesn't trust.
-        """
+        """Returns (rising, baseline). Unreliable samples are ignored
+        entirely: no baseline change, rising always False."""
         key = self._bucket_key(rpm)
 
         if not extended.reliable:

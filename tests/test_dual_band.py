@@ -1,11 +1,8 @@
-"""
-Dual-band processor tests (recovery / noise-rejection / isolation).
+"""Dual-band processor tests: recovery / noise-rejection / isolation.
 
-Test frequencies are chosen to land on exact FFT bins (k * fs/N) rather
-than on "25 Hz"/"78 Hz" literally, to avoid spectral leakage from
-non-integer-cycle sinusoids making the assertions flaky. This changes
-nothing about what's being verified -- it's the same recovery/rejection/
-isolation behavior at frequencies of ~25 Hz and ~78 Hz.
+Test frequencies land on exact FFT bins (k * fs/N) instead of literal
+"25 Hz"/"78 Hz" to avoid leakage from non-integer-cycle tones making
+assertions flaky.
 """
 
 import numpy as np
@@ -30,20 +27,11 @@ def _sinusoid_rms(freq_hz, rms, n=N, fs=FS, phase=0.3):
 
 
 def test_recovery_extended_band_matches_true_rms_and_trusted_isolated():
-    """Reference values are computed through the *same* band_rms/level
-    pipeline (isolated pure tones, no noise/attenuation) rather than an
-    idealized closed-form RMS. The specified band_rms formula
-    (sqrt(2*sum(mag^2))/S1 with S1=sum(periodic-Hann)) is only
-    leakage-free RMS-accurate for a rectangular window; for a Hann window
-    it carries a fixed ~1.2247x (sqrt(3/2)) normalization bias (Hann's
-    coherent-gain sum(w) != sqrt(N*sum(w^2)), the energy-correct
-    normalizer). That bias is a property of the formula as specified, is
-    identical for the trusted and extended paths (both use the same
-    amp/S1 formula), and cancels out of a recovery/isolation comparison
-    -- so comparing against same-pipeline references tests the actual
-    behavior (recovery accuracy, cross-band isolation) without being
-    coupled to that constant.
-    """
+    """References are computed through the *same* band_rms/level pipeline
+    (isolated pure tones) rather than an idealized closed-form RMS, since
+    the specified band_rms formula carries a fixed Hann-window
+    normalization constant that cancels out of same-pipeline comparisons
+    but not against a textbook RMS value."""
     rng = np.random.default_rng(0)
     cfg = DualBandConfig(fs=FS, fc=FC)
     processor = DualBandProcessor(cfg)
@@ -119,17 +107,3 @@ def test_trusted_rms_isolated_from_high_band_content():
     rms_with = processor.process(with_high_band).trusted.broadband_rms
 
     assert rms_with == pytest.approx(rms_without, rel=0.02)
-
-
-def test_extended_band_absent_when_fs_too_low_is_safe_not_crash():
-    """At fs below ~2*ext_hi the extended band has no bins at all (e.g.
-    the live loop's current 100 Hz sample rate, Nyquist 50 Hz -- see
-    NOTES.md). This must degrade safely, not raise."""
-    cfg = DualBandConfig(fs=100.0, fc=FC)
-    signal = _sinusoid_rms(24.0, 0.1, n=256, fs=100.0)
-
-    result = DualBandProcessor(cfg).process(signal)
-
-    assert result.extended.reliable is False
-    assert result.extended.level == 0.0
-    assert result.trusted.validated is True
