@@ -9,6 +9,8 @@ with a Murata SCA3300-D01 accelerometer over SPI.
 vibration_monitoring/
 ├── src/
 │   ├── vibration_monitor.py   # sensor read, FFT, calibration, health scoring
+│   ├── dual_band_hardware_check.py  # run on the Pi: verify timing + show
+│   │                                 # 70-82Hz+ content live (see below)
 │   ├── config.py               # dual-band processor / trend tracker config
 │   └── processing/
 │       ├── dual_band.py         # DualBandProcessor (trusted + extended bands)
@@ -49,6 +51,22 @@ Only `src/processing/` and `src/config.py` are meaningfully unit-tested
 at import time with no hardware fallback, which predates this change;
 `tests/conftest.py` stubs `spidev` so its pure functions (FFT, kurtosis,
 health scoring) can still be exercised — see `NOTES.md` Section 0.
+
+### Real-hardware check
+
+`src/dual_band_hardware_check.py` is **not** part of the pytest suite —
+run it directly on the Raspberry Pi with the SCA3300 connected:
+
+```
+python3 src/dual_band_hardware_check.py [--seconds 5]
+```
+
+It samples live data at `SAMPLE_RATE_HZ`, reports the actually-achieved
+rate/jitter (warns if it's meaningfully short of target), then runs the
+same block through both the existing general FFT/peak-finder and the
+dual-band processor so you can see, on real sensor data: that content
+above 70 Hz is now visible, and that the two stay separate outputs over
+the same input. See `NOTES.md` Section 3.
 
 ## What it does
 
@@ -116,12 +134,16 @@ and the trend tracker's `rise_ratio`/`rpm_bucket_width` are all
 placeholder defaults (marked CONFIRM in `config.py`) and must be tuned
 against real baseline vibration data, not synthetic test signals.
 
-**Known gap**: the live acquisition loop runs at `SAMPLE_RATE_HZ = 100`
-(Nyquist 50 Hz), below both the extended band (70-82 Hz) and its
-noise-gate band (95-180 Hz) — so today, every block's extended result is
-a safe no-op (`reliable=False`, `level=0.0`), not a crash or a fabricated
-reading. There is also currently no RPM source in this repo to pair with
-a block, so `extended_band_trend.csv`'s `rpm` column is blank and the
-trend tracker is not invoked (`main()`'s `rpm = None`). See `NOTES.md`
-for what's needed to close both gaps and why they weren't done silently
-here.
+**Known gaps**: the live acquisition loop runs at `SAMPLE_RATE_HZ = 200`
+(Nyquist 100 Hz) — enough to clear the extended band (70-82 Hz) with
+margin, both in the dual-band processor and in the existing general
+FFT/peak-finder, but **not** enough to clear the noise-gate band
+(95-180 Hz), which needs fs well above 360 Hz; the extended path's SNR
+estimate today only has a handful of bins (~95-100 Hz) to work with, a
+weaker noise floor estimate than intended. This rate has not been
+confirmed on real hardware — run `src/dual_band_hardware_check.py` on
+the Pi before trusting it in continuous operation (see "Testing" below).
+There is also currently no RPM source in this repo to pair with a block,
+so `extended_band_trend.csv`'s `rpm` column is blank and the trend
+tracker is not invoked (`main()`'s `rpm = None`). See `NOTES.md` for full
+detail on both gaps.

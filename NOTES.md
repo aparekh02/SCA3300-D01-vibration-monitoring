@@ -118,42 +118,44 @@ reasonable starting point *if and when* a real RPM source is wired in.
   today), not `DualBandConfig`'s own 2000.0 default. See "Sample-rate gap"
   below for why 100 Hz makes the extended band a safe no-op today.
 
-## 3. Sample-rate gap (read this before raising SAMPLE_RATE_HZ)
+## 3. Sample-rate gap (read this before changing SAMPLE_RATE_HZ further)
 
 The build brief's extended band (70-82 Hz) and noise-gate band (95-180 Hz)
 require `fs` > 2x the highest band edge (Nyquist) to be representable at
-all -- in practice comfortably above ~400 Hz so the 95-180 Hz noise
-estimate has real bins, not just the 1-2 nearest Nyquist rolls off to.
-`vibration_monitor.py`'s existing loop runs at **100 Hz** (Nyquist 50 Hz).
-At that rate, `ext_mask` and `noise_mask` are both empty for every block:
-`DualBandProcessor._extended_result()` detects this
-(`if not np.any(ext_mask)`) and returns `ExtendedBandResult(level=0.0,
-reliable=False, snr=0.0)` -- a safe, always-unreliable no-op, not a crash
-or a fabricated reading. `extended_band_trend.csv` will show
-`reliable=0`/`level=0.0` on every row until this is addressed.
+all. `vibration_monitor.py` originally ran at 100 Hz (Nyquist 50 Hz),
+below even the extended band -- both the dual-band extended path *and*
+the pre-existing general FFT/peak-finder (`compute_fft`/`find_top_peaks`,
+which has no upper cutoff of its own) were architecturally blind to
+anything above 50 Hz.
 
-This was **not** silently fixed by raising `SAMPLE_RATE_HZ` here, for two
-reasons:
-1. It's a live-hardware timing change this environment cannot verify.
-   `read_axis()` has two hardcoded `time.sleep(0.001)` settle delays per
-   axis read (see `vibration_monitor.py`), so a full x/y/z sample has a
-   hardcoded ≥3 ms floor (excluding SPI transfer time itself) -- a ceiling
-   of roughly 300 Hz *before* accounting for Python/OS call overhead.
-   Whether that's enough headroom above the ~400 Hz needed, and whether
-   those sleeps can be safely shortened without violating the SCA3300's
-   command-to-data-ready timing, needs confirming on real hardware.
-2. Raising `SAMPLE_RATE_HZ` changes existing, working behavior for the
-   *trusted*-side analysis too (FFT bin resolution, `WINDOW_SIZE`'s
-   real-time duration, the health monitor's spike buffer, which is
-   time- not sample-based via `SPIKE_BUFFER_SECONDS` so it should adapt,
-   but this needs to be re-verified against real data, not assumed) --
-   which the brief asked to keep additive/unbroken.
+**`SAMPLE_RATE_HZ` was raised 100 -> 200 Hz** (with `WINDOW_SIZE` scaled
+256 -> 512 to keep the same ~2.56s window duration/bin width as before),
+at the user's explicit request to make 70-82 Hz actually visible. This
+gives Nyquist = 100 Hz, comfortably clearing the extended band (70-82 Hz)
+-- both `DualBandProcessor`'s extended path and the existing general FFT
+now see real content up to 100 Hz. It does **not** clear the noise-gate
+band (95-180 Hz), which would need fs well above 360 Hz; the noise
+estimate today only has ~95-100 Hz of bins to work with (a handful of
+bins, weaker than intended), a real limitation carried forward rather
+than silently worked around.
 
-**TODO(SAMPLE-RATE)**: once real-hardware timing confirms it's safe, raise
-`SAMPLE_RATE_HZ` (one constant, in `vibration_monitor.py`) to at least
-~400-500 Hz and re-validate `read_axis()`'s achievable throughput at that
-rate. No other code changes are needed -- `DUAL_BAND_CONFIG` already
-tracks `SAMPLE_RATE_HZ` directly.
+200 Hz (5 ms period) was chosen specifically because `read_axis()` has
+three hardcoded `time.sleep(0.001)` settle delays per x/y/z sample -- a
+hardcoded ≥3 ms floor before any SPI transfer time is even counted. 5 ms
+leaves some margin above that 3 ms floor; something like 500 Hz (2 ms
+period) would not, without redesigning `read_axis()`'s timing (out of
+scope here, and a hardware-timing question this environment cannot
+verify). **This still needs confirming on the real Pi** --
+`src/dual_band_hardware_check.py` (see README "Testing") measures the
+actually-achieved rate/jitter and prints a warning if it's >10% short of
+target; run it after wiring up the sensor, and back `SAMPLE_RATE_HZ` off
+if it warns.
+
+**TODO(SAMPLE-RATE)**: if/when the noise-gate band needs to be real (not
+just the extended band), either raise `SAMPLE_RATE_HZ` further (requires
+redesigning `read_axis()`'s per-axis timing budget first -- current
+architecture tops out well under 360 Hz) or narrow `noise_lo`/`noise_hi`
+in `config.py` to fit under whatever Nyquist is actually achievable.
 
 ## 4. Two-path design and isolation guarantee
 

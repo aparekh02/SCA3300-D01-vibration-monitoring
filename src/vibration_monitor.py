@@ -110,17 +110,27 @@ def read_xyz():
 # Configuration
 # ==================================================================
 
-# CONFIRM before relying on the dual-band extended path (see
-# processing/dual_band.py): Nyquist here is SAMPLE_RATE_HZ/2 = 50 Hz, which
-# is below both the extended band (70-82 Hz) and its noise-gate band
-# (95-180 Hz) -- see NOTES.md. Raising this is the one change needed to
-# make that path produce real (rather than safely-empty) output; it has
-# not been raised here since the read_axis() timing budget (three
-# hardcoded 1 ms settle sleeps per x/y/z sample = 3 ms floor) needs
-# verifying against real hardware before assuming a higher rate is
-# achievable.
-SAMPLE_RATE_HZ   = 100          # target sampling rate (Hz)
-WINDOW_SIZE      = 256          # samples per FFT window (power of 2 recommended)
+# CONFIRM on real hardware (run src/dual_band_hardware_check.py) before
+# trusting this in continuous operation -- see NOTES.md Section 3.
+#
+# Raised from 100 -> 200 Hz so Nyquist (100 Hz) clears the dual-band
+# extended band (70-82 Hz) with margin, which also gives the EXISTING
+# general FFT/peak-finder (compute_fft/find_top_peaks below -- unchanged,
+# it has no upper cutoff of its own) visibility into that range for the
+# first time; at 100 Hz neither could see past 50 Hz. 200 Hz was chosen,
+# not something higher, because read_axis() has three hardcoded 1 ms
+# settle sleeps per x/y/z sample (3 ms floor before SPI transfer time is
+# even counted) -- a ~200 Hz sample period (5 ms) leaves some margin
+# above that floor, where e.g. 500 Hz (2 ms period) would not. It does
+# NOT clear the extended path's 95-180 Hz noise-gate band (that would
+# need fs well above 360 Hz, out of reach of this loop's timing budget
+# without redesigning read_axis() -- out of scope here); the noise
+# estimate is correspondingly weaker (only ~95-100 Hz worth of bins) --
+# see NOTES.md.
+SAMPLE_RATE_HZ   = 200          # target sampling rate (Hz)
+WINDOW_SIZE      = 512          # samples per FFT window (power of 2 recommended)
+                                 # -- scaled with SAMPLE_RATE_HZ to keep the
+                                 # same ~2.56s window duration/bin width as before
 
 BASE_DIR         = Path(__file__).resolve().parent.parent
 RAW_LOG_FILE     = BASE_DIR / "data" / "raw" / "raw_vibration_log.csv"
